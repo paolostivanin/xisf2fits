@@ -1,0 +1,4 @@
+astropy>=6
+numpy>=1.24
+lz4>=4
+zstandard>=0.22
