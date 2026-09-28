@@ -239,7 +239,8 @@ void publish(const fs::path& temporary, const fs::path& destination, bool overwr
             std::error_code error;
             fs::create_hard_link(temporary, output, error);
             if (error) throw std::system_error(error, "safe no-replace publication unavailable or destination exists: " + output.string());
-            fs::remove(temporary);
+            // The output is published; TemporaryOutput retries removing a leftover link.
+            fs::remove(temporary, error);
         }
     }
     // Once renamed, the target contains the complete file. A subsequent sync

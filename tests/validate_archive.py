@@ -1,6 +1,6 @@
 """Optional, read-only archive validation. Outputs live in a temporary directory.
 
-Usage: python tests/validate_archive.py BUILD/xisf2fits /path/to/DeepSky
+Usage: python tests/validate_archive.py BUILD/xisf2fits /path/to/archive
 Select one frame per NINA version and one frame with PixInsight commentary.
 This is deliberately separate from CTest, which needs no personal archive.
 """

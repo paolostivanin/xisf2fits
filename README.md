@@ -9,7 +9,7 @@ Version 0.2 fixes invalid legacy NINA headers, missing commentary/properties,
 unchecked source corruption, and unsafe filename interpretation. Existing FITS
 files produced by 0.1 should be regenerated from their XISFs with
 `--overwrite --verify`. See [the review](docs/REVIEW.md) for the findings and
-validation results.
+validation results, and [the follow-up triage](docs/FIXES.md) for later fixes.
 
 ## Build
 
@@ -44,8 +44,8 @@ path; directory symlinks are not followed.
 
 ```sh
 ./build/xisf2fits --verify input.xisf out.fits.fz
-./build/xisf2fits --dry-run /mnt/photos/DeepSky ./fits-output
-./build/xisf2fits --verify /mnt/photos/DeepSky ./fits-output
+./build/xisf2fits --dry-run ~/astro/raw ./fits-output
+./build/xisf2fits --verify ~/astro/raw ./fits-output
 ```
 
 | Option | Behavior |
@@ -68,7 +68,10 @@ header with different formatting can require regeneration even if values match.
 Unsupported sample formats, RGB images, and multi-image containers are skipped
 in batches. Malformed data is a failure. Directory-access failures are reported
 while other directories continue. Inputs mapping to the same destination are
-reported as collisions before either is converted. Exit status is `1` if any
+reported as collisions before either is converted. Destinations differing only
+in ASCII letter case (`M31/a.xisf` and `m31/a.xisf`) also collide, even on
+case-sensitive filesystems, so a batch cannot silently lose files when copied to
+or written on a case-insensitive one. Exit status is `1` if any
 file/directory failed, otherwise `0`; interruption returns `128 + signal`.
 
 ## Pixels and source integrity
@@ -76,13 +79,15 @@ file/directory failed, otherwise `0`; interruption returns `128 + signal`.
 Supported storage: attachment, inline base64/base16, and embedded data;
 uncompressed, zlib, LZ4, LZ4HC, or Zstandard; compressed subblocks and byte
 shuffling. Only little-endian UInt16, single-channel Gray images are accepted.
-The XML header is limited to 64 MiB; DTDs and external data locations are rejected.
+The XML header, including inline and embedded blocks, is limited to 64 MiB, and
+decoded string properties to 64 MiB in total. DTDs and external data locations
+are rejected.
 Dimensions, arithmetic, source block extents, compression descriptors, and exact
 decompressed sizes are checked before output creation.
 
 Every declared source block checksum is validated during a conversion, **even
-without `--verify`**. SHA-1, SHA-256, and SHA-512 are supported, including hyphenated
-algorithm names. The digest covers stored bytes before decompression and byte
+without `--verify`**. SHA-1, SHA-256, SHA-512, SHA3-256, and SHA3-512 are supported;
+the SHA-1/SHA-2 names are accepted with or without a hyphen. The digest covers stored bytes before decompression and byte
 unshuffling. An invalid, unsupported, or mismatched declared checksum is an
 error. An image without a checksum produces a warning: comparing decoded pixels
 with FITS cannot establish whether the source was already damaged. Source hashes
@@ -98,7 +103,10 @@ them and writes `ROWORDER='BOTTOM-UP'`. Row reversal is rejected when WCS or
 distortion keywords are present. Ordinary NINA pointing hints such as RA, DEC,
 and EQUINOX are retained. Supported Bayer patterns are normalized to the first
 output pixel, with zero `XBAYROFF`/`YBAYROFF`; reversal accounts for image-height
-parity. Conflicting XML/FITS CFA descriptions or unsupported patterns fail.
+parity. Trailing blanks in `BAYERPAT` are ignored. An XML `ColorFilterArray`
+already describes the first stored pixel: FITS offsets apply only to `BAYERPAT`,
+so a nonzero offset with an XML CFA and no `BAYERPAT` is ambiguous and fails.
+Conflicting XML/FITS CFA descriptions or unsupported patterns fail.
 
 ## Metadata contract
 
@@ -169,8 +177,9 @@ files are not proof of success: use `--verify` when resuming an archive migratio
 
 ## Tests
 
-The default `BUILD_TESTING=ON` configuration requires an independent Python FITS
-reader and fixture encoders. These are test-only dependencies:
+Integration tests need an independent Python FITS reader and fixture encoders.
+These are test-only dependencies; without them, the default `BUILD_TESTING=ON`
+configuration warns and registers only the C++ unit tests:
 
 ```sh
 python3 -m venv .venv
@@ -201,5 +210,31 @@ checks source hashes/decompression, every pixel, and capture/property metadata.
 It writes only temporary outputs and does not modify the archive:
 
 ```sh
-.venv/bin/python tests/validate_archive.py build/xisf2fits /mnt/photos/DeepSky
+.venv/bin/python tests/validate_archive.py build/xisf2fits ~/astro/raw
 ```
+
+## Supported platforms
+
+Linux is the tested platform, including the fault-injection publication tests.
+macOS may build but is untested; its `fsync` does not force a full flush to
+stable storage (`F_FULLFSYNC` is not used), so durability guarantees are weaker.
+Windows is not supported.
+
+## Known issues
+
+- Real NINA frames produce many `truncated header comment` warnings (about a
+  dozen per file), one per affected card. Values are never truncated.
+- Some filesystems and network mounts reject `fsync` on a directory with
+  `EINVAL`. The file is then reported as failed even though the complete output
+  was already published; `--verify` on a rerun confirms it.
+- A single unrepresentable value fails the whole file rather than omitting that
+  value: for example a NaN numeric property, or an `XBAYROFF`/`YBAYROFF` of zero
+  without a Bayer pattern.
+- The decoded image size is bounded only by its declared geometry and the
+  exact-size checks, not by an application memory budget. A small compressed
+  block declaring a very large image can allocate accordingly before its
+  decompression fails.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

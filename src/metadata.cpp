@@ -269,20 +269,30 @@ Metadata prepareMetadata(const Source& source, bool bottomUp) {
         return it == indexes.end() ? nullptr : &metadata.cards[it->second];
     };
     const auto* patternCard = find("BAYERPAT");
-    std::string pattern = patternCard ? upper(patternCard->value) : source.cfa;
+    std::string pattern = source.cfa;
+    if (patternCard) {
+        // Trailing blanks are insignificant in FITS strings; CFITSIO pads to 8.
+        pattern = upper(patternCard->value);
+        pattern.erase(pattern.find_last_not_of(' ') + 1);
+    }
+    auto parity = [](const Card* card) {
+        if (card->type != ValueType::Integer) fail("invalid Bayer offset");
+        // Only parity matters; avoid narrowing arbitrary integer strings.
+        return (card->value.back() - '0') % 2;
+    };
     auto offset = [&](const char* key, const char* alternate) {
         const auto* a = find(key); const auto* b = find(alternate);
-        if (a && b && a->value != b->value) fail("conflicting Bayer offsets");
+        if (a && b && parity(a) != parity(b)) fail("conflicting Bayer offsets");
         const auto* c = a ? a : b;
-        if (!c) return 0;
-        if (c->type != ValueType::Integer) fail("invalid Bayer offset");
-        // Only parity matters; avoid narrowing arbitrary integer strings.
-        return (c->value.back() - '0') % 2;
+        return c ? parity(c) : 0;
     };
     const int x = offset("XBAYROFF", "XBAYEROFF"), y = offset("YBAYROFF", "YBAYEROFF");
     if (!pattern.empty()) {
         static const std::set<std::string> patterns = {"RGGB", "BGGR", "GRBG", "GBRG"};
         if (!patterns.count(pattern) || (!source.cfa.empty() && !patterns.count(source.cfa))) fail("unsupported Bayer pattern");
+        // An XML CFA already describes the first stored pixel; FITS offsets
+        // apply only to BAYERPAT. Without it, a nonzero offset is ambiguous.
+        if (!patternCard && (x || y)) fail("Bayer offsets are ambiguous with an XML CFA and no BAYERPAT");
         std::string effective = pattern;
         for (int row = 0; row < 2; ++row)
             for (int col = 0; col < 2; ++col) effective[row * 2 + col] = pattern[((row + y) % 2) * 2 + (col + x) % 2];

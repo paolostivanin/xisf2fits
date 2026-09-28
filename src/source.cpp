@@ -19,6 +19,8 @@
 namespace x2f {
 namespace {
 using Bytes = std::vector<unsigned char>;
+// Limit for the XML header and, separately, for decoded String properties.
+constexpr uint64_t metadataBudget = 64 * 1024 * 1024;
 std::string attr(xmlNode* node, const char* name) {
     auto* p = xmlGetProp(node, BAD_CAST name);
     std::string value = p ? reinterpret_cast<const char*>(p) : "";
@@ -183,12 +185,15 @@ Block inspectBlock(xmlNode* node, uint64_t fileSize, uint64_t headerEnd) {
 const EVP_MD* checksumAlgorithm(const Block& b, std::string& expected) {
     auto fields = split(b.checksum, ':');
     if (fields.size() != 2) fail("invalid source checksum: " + b.label);
-    auto name = upper(fields[0]);
-    name.erase(std::remove(name.begin(), name.end(), '-'), name.end());
-    if (name != "SHA1" && name != "SHA256" && name != "SHA512")
-        fail("unsupported source checksum algorithm: " + fields[0]);
-    auto* md = EVP_get_digestbyname(name.c_str());
-    if (!md) fail("unavailable source checksum algorithm: " + name);
+    // XISF 1.0 algorithm names, mapped to OpenSSL digest names.
+    static const std::map<std::string, std::string> names = {
+        {"SHA1", "SHA1"}, {"SHA-1", "SHA1"}, {"SHA256", "SHA256"}, {"SHA-256", "SHA256"},
+        {"SHA512", "SHA512"}, {"SHA-512", "SHA512"}, {"SHA3-256", "SHA3-256"}, {"SHA3-512", "SHA3-512"}
+    };
+    const auto name = names.find(upper(fields[0]));
+    if (name == names.end()) fail("unsupported source checksum algorithm: " + fields[0]);
+    auto* md = EVP_get_digestbyname(name->second.c_str());
+    if (!md) fail("unavailable source checksum algorithm: " + name->second);
     expected = upper(fields[1]);
     if (expected.size() != static_cast<size_t>(EVP_MD_size(md)) * 2 ||
         !std::all_of(expected.begin(), expected.end(), [](char c) { return hexDigit(c) >= 0; }))
@@ -280,13 +285,15 @@ Source readSource(const fs::path& path, bool dryRun) {
         headerLength |= uint32_t(signature[8 + i]) << (8 * i);
         if (signature[12 + i]) fail("nonzero XISF reserved signature bytes");
     }
-    if (!headerLength || headerLength > 64 * 1024 * 1024 || headerLength > fileSize - 16)
+    if (!headerLength || headerLength > metadataBudget || headerLength > fileSize - 16)
         fail("invalid or oversized XISF XML header length (limit 64 MiB)");
     Bytes xml(headerLength);
     readExact(stream, xml.data(), xml.size());
+    // libxml2 otherwise caps text nodes at 10,000,000 bytes, rejecting inline
+    // blocks within the header budget. The size cap and DTD rejection bound it.
     std::unique_ptr<xmlDoc, decltype(&xmlFreeDoc)> doc(
         xmlReadMemory(reinterpret_cast<const char*>(xml.data()), static_cast<int>(xml.size()), nullptr, nullptr,
-                      XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING), xmlFreeDoc);
+                      XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING | XML_PARSE_HUGE), xmlFreeDoc);
     if (!doc || doc->intSubset || doc->extSubset) fail("invalid XISF XML or forbidden DTD");
     auto* root = xmlDocGetRootElement(doc.get());
     if (!root || !named(root, "xisf") || attr(root, "version") != "1.0") fail("unsupported XISF root or version");
@@ -327,6 +334,14 @@ Source readSource(const fs::path& path, bool dryRun) {
     if (pixelBlock.decodedSize != pixelBytes) fail("image block size differs from geometry");
     if (pixelBlock.shuffle != 1 && pixelBlock.shuffle != 2) fail("invalid UInt16 shuffle item size");
     if (pixelBlock.checksum.empty()) source.warnings.push_back("source image checksum absent; source integrity cannot be verified");
+    // Check advertised sizes before allocating: a tiny compressed block can
+    // claim an arbitrary decoded size.
+    uint64_t stringBytes = 0;
+    for (const auto& [node, block] : blocks) {
+        if (node == image || !named(node, "Property") || attr(node, "type") != "String") continue;
+        if (block.decodedSize > metadataBudget - stringBytes) fail("decoded XISF string properties exceed 64 MiB");
+        stringBytes += block.decodedSize;
+    }
 
     std::map<xmlNode*, std::string> strings;
     for (const auto& [node, block] : blocks) {

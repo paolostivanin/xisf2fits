@@ -161,9 +161,13 @@ int main(int argc, char** argv) {
             relative.replace_extension(".fits.fz");
             destinations[options.output / relative].push_back(input);
         }
+        // Destinations differing only in case collide on case-insensitive
+        // filesystems; refuse them everywhere rather than probe the target.
+        std::map<std::string, size_t> folded;
+        for (const auto& entry : destinations) ++folded[upper(entry.first.string())];
         for (const auto& [output, sources] : destinations) {
             checkpoint();
-            if (sources.size() > 1) {
+            if (sources.size() > 1 || folded[upper(output.string())] > 1) {
                 for (const auto& source : sources) { std::cerr << "FAILED " << source << ": destination collision: " << output << '\n'; ++failed; }
                 continue;
             }

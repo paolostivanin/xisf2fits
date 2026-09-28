@@ -50,7 +50,7 @@ def fixture(path, pixels=PIXELS, keywords=(), properties=(), codec=None, shuffle
     if subblocks:
         attrs["subblocks"] = ":".join(f"{len(c)},{len(r)}" for c, r in zip(compressed, chunks))
     if checksum:
-        digest = hashlib.new(checksum.replace("-", ""), stored).hexdigest()
+        digest = hashlib.new(checksum.lower().replace("sha3-", "sha3_").replace("-", ""), stored).hexdigest()
         attrs["checksum"] = checksum + ":" + ("0" * len(digest) if bad_checksum else digest)
     if location == "attachment":
         attrs["location"] = f"attachment:16384:{len(stored)}"
@@ -79,7 +79,7 @@ def fixture(path, pixels=PIXELS, keywords=(), properties=(), codec=None, shuffle
         ET.SubElement(image, tag, attributes)
     xml = ET.tostring(root, encoding="utf-8")
     header = b"XISF0100" + struct.pack("<II", len(xml), 0) + xml
-    assert len(header) <= 16384
+    assert location != "attachment" or len(header) <= 16384
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(header + (b"\0" * (16384 - len(header)) + stored if location == "attachment" else b""))
@@ -227,11 +227,31 @@ class ConversionTests(unittest.TestCase):
         self.assertIn("source hashes not checked", r.stdout)
 
     def test_checksum_aliases(self):
-        for algorithm in ("sha1", "sha-1", "sha256", "sha-256", "sha512", "sha-512"):
+        for algorithm in ("sha1", "sha-1", "sha256", "sha-256", "sha512", "sha-512", "sha3-256", "SHA3-512"):
             with self.subTest(algorithm=algorithm):
                 fixture(self.src, checksum=algorithm)
                 self.convert("--verify", "--overwrite")
                 self.check_fits()
+
+    def test_large_inline_block(self):
+        # Over libxml2's default 10,000,000-byte text-node limit once encoded.
+        pixels = (np.arange(2400 * 2200, dtype=np.uint32) * 7919 % 65536).astype(np.uint16).reshape(2200, 2400)
+        for location in ("inline:base64", "embedded"):
+            with self.subTest(location=location):
+                fixture(self.src, pixels=pixels, location=location)
+                self.convert("--overwrite")
+                self.check_fits(pixels)
+
+    def test_string_property_budget(self):
+        # A small compressed block may advertise an arbitrary decoded size.
+        big = {"id": "Big", "type": "String", "location": f"attachment:16384:{PIXELS.size * 2}",
+               "compression": f"zlib:{1 << 30}"}
+        fixture(self.src, extra=[("Property", big)])
+        for option in ([], ["--dry-run"]):
+            with self.subTest(option=option):
+                r = self.run_converter(*option, self.src, self.out, expected=1)
+                self.assertIn("string properties exceed 64 MiB", r.stderr)
+                self.assertFalse(self.out.exists())
 
     def test_missing_checksum_explicit(self):
         fixture(self.src, checksum=None)
@@ -315,6 +335,26 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(self.check_fits(PIXELS[:2][::-1])["BAYERPAT"], "GBRG")
         fixture(self.src, extra=extra, keywords=[("BAYERPAT", "'BGGR'", "")])
         self.run_converter("--overwrite", self.src, self.out, expected=1)
+        # The XML CFA already describes the first pixel; a nonzero offset without
+        # BAYERPAT is ambiguous, while a zero offset is not.
+        fixture(self.src, pixels=PIXELS[:2], extra=extra, keywords=[("XBAYROFF", "1", "")])
+        r = self.run_converter("--overwrite", self.src, self.out, expected=1)
+        self.assertIn("ambiguous", r.stderr)
+        fixture(self.src, pixels=PIXELS[:2], extra=extra, keywords=[("XBAYROFF", "0", "")])
+        self.convert("--verify", "--overwrite")
+        self.assertEqual(self.check_fits(PIXELS[:2])["BAYERPAT"], "RGGB")
+
+    def test_bayer_padding_and_offset_forms(self):
+        # Trailing blanks are insignificant in FITS strings.
+        fixture(self.src, pixels=PIXELS[:2], keywords=[("BAYERPAT", "'RGGB    '", "")])
+        self.convert("--verify", "--overwrite")
+        self.assertEqual(self.check_fits(PIXELS[:2])["BAYERPAT"], "RGGB")
+        # Equal offsets written differently must not conflict.
+        fixture(self.src, pixels=PIXELS[:2], keywords=[("BAYERPAT", "'RGGB'", ""), ("XBAYROFF", "1", ""),
+                                                       ("XBAYEROFF", "+1", "")])
+        self.convert("--verify", "--overwrite")
+        h = self.check_fits(PIXELS[:2])
+        self.assertEqual((h["BAYERPAT"], h["XBAYROFF"]), ("GRBG", 0))
 
     def test_source_continue_cards(self):
         fixture(self.src, keywords=[("OBJECT", "'first&'", ""), ("CONTINUE", "' second&'", ""),
@@ -416,6 +456,21 @@ class ConversionTests(unittest.TestCase):
         self.assertFalse((outdir / "a.fits.fz").exists())
         self.check_fits(path=outdir / "good.fits.fz")
 
+    def test_batch_case_collision(self):
+        srcdir, outdir = self.root / "sources", self.root / "outputs"
+        fixture(srcdir / "x" / "a.xisf")
+        if (srcdir / "X" / "a.xisf").exists():
+            self.skipTest("source filesystem is case-insensitive")
+        fixture(srcdir / "X" / "a.xisf")
+        fixture(srcdir / "good.xisf")
+        # Refused even on case-sensitive destinations, where both could coexist.
+        r = self.run_converter("--verify", srcdir, outdir, expected=1)
+        self.assertEqual(r.stderr.count("destination collision"), 2)
+        self.assertIn("1 converted, 0 skipped, 2 failed", r.stdout)
+        self.assertFalse((outdir / "x" / "a.fits.fz").exists())
+        self.assertFalse((outdir / "X" / "a.fits.fz").exists())
+        self.check_fits(path=outdir / "good.fits.fz")
+
     def test_batch_unreadable_directory(self):
         if os.geteuid() == 0:
             self.skipTest("permission test requires unprivileged user")
@@ -452,6 +507,13 @@ class ConversionTests(unittest.TestCase):
         self.run_converter("--verify", self.src, self.out, env=self.fault_environment("no-hardlinks"))
         self.check_fits()
         self.assertEqual((self.root / "sync.log").read_text(), "FDD")
+
+    def test_published_output_survives_stale_temporary(self):
+        fixture(self.src)
+        self.run_converter("--verify", self.src, self.out, env=self.fault_environment("stale-temporary"))
+        self.check_fits()
+        # The blocked removal leaves the private temporary directory behind.
+        self.assertTrue(list(self.root.glob(".xisf2fits-*/image.tmp")))
 
     def test_publication_race_cannot_clobber_destination(self):
         fixture(self.src)

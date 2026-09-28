@@ -2,12 +2,14 @@
 // linked into or installed with the converter.
 #include <cerrno>
 #include <csignal>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 namespace {
@@ -44,4 +46,28 @@ extern "C" int linkat(int fromfd, const char* from, int tofd, const char* to, in
     if (mode("no-hardlinks")) { errno = EOPNOTSUPP; return -1; }
     auto real = reinterpret_cast<int (*)(int, const char*, int, const char*, int)>(dlsym(RTLD_NEXT, "linkat"));
     return real(fromfd, from, tofd, to, flags);
+}
+// Force the hard-link publication fallback and make removing the temporary
+// link fail after the output is already published.
+extern "C" long syscall(long number, ...) {
+    va_list list;
+    va_start(list, number);
+    long args[6];
+    for (auto& arg : args) arg = va_arg(list, long);
+    va_end(list);
+#ifdef SYS_renameat2
+    if (number == SYS_renameat2 && mode("stale-temporary")) { errno = ENOSYS; return -1; }
+#endif
+    auto real = reinterpret_cast<long (*)(long, ...)>(dlsym(RTLD_NEXT, "syscall"));
+    return real(number, args[0], args[1], args[2], args[3], args[4], args[5]);
+}
+extern "C" int remove(const char* path) {
+    if (mode("stale-temporary") && std::strstr(path, "/image.tmp")) { errno = EBUSY; return -1; }
+    auto real = reinterpret_cast<int (*)(const char*)>(dlsym(RTLD_NEXT, "remove"));
+    return real(path);
+}
+extern "C" int unlink(const char* path) {
+    if (mode("stale-temporary") && std::strstr(path, "/image.tmp")) { errno = EBUSY; return -1; }
+    auto real = reinterpret_cast<int (*)(const char*)>(dlsym(RTLD_NEXT, "unlink"));
+    return real(path);
 }
