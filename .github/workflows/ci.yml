@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Release
+            cmake-args: ""
+          - name: Sanitizers (ASan + UBSan)
+            cmake-args: "-DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake g++ pkg-config \
+            libcfitsio-dev libxml2-dev libssl-dev liblz4-dev libzstd-dev zlib1g-dev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r tests/requirements.txt
+
+      # Recent runner kernels use more ASLR entropy than AddressSanitizer supports.
+      - name: Lower ASLR entropy for AddressSanitizer
+        if: contains(matrix.cmake-args, 'ENABLE_SANITIZERS')
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: cmake -S . -B build -DBUILD_TESTING=ON -DPython3_EXECUTABLE="$PWD/.venv/bin/python" ${{ matrix.cmake-args }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

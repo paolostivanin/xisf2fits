@@ -12,6 +12,19 @@ template<class F> void rejects(F&& action, const std::string& message) {
     try { action(); } catch (const std::exception&) { threw = true; }
     require(threw, message);
 }
+bool warned(const Metadata& metadata, const std::string& text) {
+    for (const auto& warning : metadata.warnings) if (warning.find(text) != std::string::npos) return true;
+    return false;
+}
+bool hasCard(const Metadata& metadata, const std::string& name) {
+    for (const auto& card : metadata.cards) if (card.name == name) return true;
+    return false;
+}
+Source frame(std::vector<Keyword> keywords, std::vector<Property> properties = {}, std::string cfa = {}) {
+    Source source; source.width = 2; source.height = 2;
+    source.keywords = std::move(keywords); source.properties = std::move(properties); source.cfa = std::move(cfa);
+    return source;
+}
 std::string contents(const fs::path& p) { std::ifstream f(p); return {std::istreambuf_iterator<char>(f), {}}; }
 void put(const fs::path& p, const std::string& s) { std::ofstream f(p); f << s; }
 }
@@ -41,6 +54,74 @@ int main() {
         metadata.cards.push_back({"LONG", std::string(150, '\'') + "&", "comment", ValueType::String});
         auto records = headerRecords(metadata);
         for (const auto& r : records) require(r.size() == 80, "all records have exactly 80 bytes");
+
+        // Typographic quotes and dashes are exact; only lossy replacements are flagged.
+        bool lossy = false;
+        require(ascii("Bob\xE2\x80\x99s \xE2\x80\x9Cscope\xE2\x80\x9D \xE2\x80\x93 70", lossy) == "Bob's \"scope\" - 70" && !lossy,
+                "curly quotes and dashes normalize losslessly");
+        for (const auto& text : {"caf\xC3\xA9", "a\tb", "a\nb"}) {
+            lossy = false; ascii(text, lossy);
+            require(lossy, std::string("lossy replacement flagged: ") + text);
+        }
+
+        // Known benign differences between XISF properties and capture keywords.
+        const Keyword ninaCreator{"SWCREATE", "'N.I.N.A. 3.1.2.9001 (x64)'", ""};
+        const Property focuser{"IMAGE", "Instrument:Focuser:Position", "Float32", "0", ""};
+        require(!warned(prepareMetadata(frame({ninaCreator, {"FOCUSPOS", "3200", ""}}, {focuser}), false), "conflicts"),
+                "NINA zero focuser property is not a conflict");
+        require(warned(prepareMetadata(frame({{"SWCREATE", "'SomeApp 1.0'", ""}, {"FOCUSPOS", "3200", ""}}, {focuser}), false), "conflicts with FOCUSPOS"),
+                "zero focuser property from other software is a conflict");
+        require(warned(prepareMetadata(frame({ninaCreator, {"FOCUSPOS", "3200", ""}},
+                {{"IMAGE", "Instrument:Focuser:Position", "Float32", "3100", ""}}), false), "conflicts with FOCUSPOS"),
+                "nonzero NINA focuser property still conflicts");
+        const Keyword dateObs{"DATE-OBS", "'2023-11-17T18:15:09.635'", ""};
+        require(!warned(prepareMetadata(frame({dateObs}, {{"IMAGE", "Observation:Time:Start", "TimePoint", "2023-11-17T18:15:09.6350Z", ""}}), false), "conflicts"),
+                "TimePoint zone designator and fractional zeros are insignificant");
+        require(warned(prepareMetadata(frame({dateObs}, {{"IMAGE", "Observation:Time:Start", "TimePoint", "2023-11-17T18:15:09.636Z", ""}}), false), "conflicts with DATE-OBS"),
+                "different TimePoint conflicts");
+
+        // Lossy ASCII replacements are listed once per file, not once per card.
+        auto lossyMetadata = prepareMetadata(frame({{"FOCNAME", "'caf\xC3\xA9'", ""}, {"OBJECT", "'M\xC3\xA9'", ""},
+                                                    {"TELESCOP", "'Bob\xE2\x80\x99s'", ""}}), false);
+        int lossyWarnings = 0;
+        for (const auto& w : lossyMetadata.warnings) lossyWarnings += w.find("ASCII-normalized") != std::string::npos;
+        require(lossyWarnings == 1 && warned(lossyMetadata, "(lossy): FOCNAME, OBJECT") && !warned(lossyMetadata, "TELESCOP"),
+                "one lossy normalization warning naming only lossy keywords");
+
+        // Bayer offsets: tokens, not parity, decide whether they are zero.
+        for (const auto& zero : {"0", "+000", "-0"}) {
+            auto m = prepareMetadata(frame({{"XBAYROFF", zero, ""}, {"YBAYEROFF", "0", ""}}), false);
+            require(warned(m, "omitted zero Bayer offsets without a pattern: XBAYROFF, YBAYEROFF") &&
+                    !hasCard(m, "XBAYROFF") && !hasCard(m, "YBAYEROFF") && !hasCard(m, "BAYERPAT"),
+                    std::string("zero offsets omitted: ") + zero);
+        }
+        const std::string xmlCfa = "RGGB";
+        for (const auto& offset : {"1", "2", "-2", "123456789012345678901234567890"}) {
+            rejects([&] { prepareMetadata(frame({{"YBAYROFF", offset, ""}}), false); }, std::string("nonzero offset without pattern: ") + offset);
+            rejects([&] { prepareMetadata(frame({{"YBAYROFF", offset, ""}}, {}, xmlCfa), false); }, std::string("nonzero offset with XML CFA only: ") + offset);
+        }
+        rejects([&] { prepareMetadata(frame({{"XBAYROFF", "0", ""}, {"XBAYEROFF", "2", ""}}, {}, xmlCfa), false); }, "alias cannot hide a nonzero offset");
+        rejects([&] { prepareMetadata(frame({{"XBAYROFF", "0.0", ""}}), false); }, "non-integer offset");
+        auto cfaMetadata = prepareMetadata(frame({{"XBAYROFF", "-0", ""}}, {}, xmlCfa), false);
+        require(hasCard(cfaMetadata, "BAYERPAT") && !warned(cfaMetadata, "omitted"), "zero offset with XML CFA keeps the pattern");
+        for (const auto& empty : {"''", "'   '", ""}) {
+            rejects([&] { prepareMetadata(frame({{"BAYERPAT", empty, ""}}, {}, xmlCfa), false); }, std::string("empty BAYERPAT with XML CFA: ") + empty);
+            rejects([&] { prepareMetadata(frame({{"BAYERPAT", empty, ""}}), false); }, std::string("empty BAYERPAT: ") + empty);
+        }
+        auto shifted = prepareMetadata(frame({{"BAYERPAT", "'RGGB'", ""}, {"XBAYROFF", "-2", ""}, {"YBAYROFF", "1", ""}}), false);
+        for (const auto& card : shifted.cards) if (card.name == "BAYERPAT") require(card.value == "GBRG", "parity shifts a valid BAYERPAT");
+
+        // Truncated comments are recorded once per keyword, in header order.
+        auto truncation = prepareMetadata(frame({{"OBJECT", "'" + std::string(60, 'x') + "'", std::string(40, 'a')},
+                                                 {"SHORT", "1", "fits"},
+                                                 {"FULL", "'" + std::string(68, 'f') + "'", "dropped"},
+                                                 {"LONGSTR", "'" + std::string(150, 's') + "'", std::string(60, 'c')}}), false);
+        headerRecords(truncation);
+        require((truncation.truncatedComments == std::vector<std::string>{"OBJECT", "FULL", "LONGSTR"}), "truncated comments listed in header order");
+        require(!warned(truncation, "truncated"), "truncation is a note, not a warning");
+        auto intact = prepareMetadata(frame({{"SHORT", "1", "fits"}}), false);
+        headerRecords(intact);
+        require(intact.truncatedComments.empty(), "no truncation recorded when every comment fits");
 
         std::string pattern = (fs::temp_directory_path() / "xisf2fits-unit-XXXXXX").string();
         require(::mkdtemp(pattern.data()), "temporary test directory");
