@@ -33,14 +33,13 @@ uint64_t unsignedNumber(const std::string& value, const std::string& context) {
         fail("invalid " + context + ": " + value);
     return result;
 }
-std::string ascii(const std::string& input, bool& changed) {
+std::string ascii(const std::string& input, bool& lossy) {
     std::string output;
     for (size_t i = 0; i < input.size();) {
         const auto c = static_cast<unsigned char>(input[i]);
         if (c >= 32 && c <= 126) { output += static_cast<char>(c); ++i; continue; }
-        changed = true;
         const std::string_view rest(input.data() + i, input.size() - i);
-        if (c == '\t' || c == '\r' || c == '\n') { output += ' '; ++i; }
+        if (c == '\t' || c == '\r' || c == '\n') { output += ' '; ++i; lossy = true; }
         else if (rest.substr(0, 3) == "\xE2\x80\x98" || rest.substr(0, 3) == "\xE2\x80\x99") {
             output += '\''; i += 3;
         } else if (rest.substr(0, 3) == "\xE2\x80\x9C" || rest.substr(0, 3) == "\xE2\x80\x9D") {
@@ -48,7 +47,7 @@ std::string ascii(const std::string& input, bool& changed) {
         } else if (rest.substr(0, 3) == "\xE2\x80\x93" || rest.substr(0, 3) == "\xE2\x80\x94") {
             output += '-'; i += 3;
         } else {
-            output += '?'; ++i;
+            output += '?'; ++i; lossy = true;
             while (i < input.size() && (static_cast<unsigned char>(input[i]) & 0xC0) == 0x80) ++i;
         }
     }

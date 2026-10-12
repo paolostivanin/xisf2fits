@@ -19,7 +19,9 @@ void checkpoint();
 void checkFits(int status, const std::string& operation);
 std::string upper(std::string value);
 std::string trim(const std::string& value);
-std::string ascii(const std::string& value, bool& changed);
+// Sets lossy when a character is replaced by '?' or control whitespace by a
+// space; typographic quotes and dashes have exact ASCII equivalents.
+std::string ascii(const std::string& value, bool& lossy);
 uint64_t unsignedNumber(const std::string& value, const std::string& context);
 
 struct Keyword { std::string name, value, comment; };
@@ -43,6 +45,9 @@ struct Card {
 struct Metadata {
     std::vector<Card> cards;
     std::vector<std::string> warnings;
+    // Keywords whose comments did not fit their card, in header order. NINA
+    // frames always have some, so this is summarized rather than a warning.
+    std::vector<std::string> truncatedComments;
 };
 bool structuralKeyword(const std::string& name);
 bool wcsKeyword(const std::string& name);

@@ -40,8 +40,12 @@ def pixels(path, image):
         stream.seek(int(offset))
         stored = stream.read(int(size))
     assert len(stored) == int(size)
-    algorithm, digest = image.get("checksum").split(":")
-    assert hashlib.new(algorithm.replace("-", ""), stored).hexdigest() == digest.lower()
+    if image.get("checksum"):
+        algorithm, digest = image.get("checksum").split(":")
+        # XISF names (SHA-1, SHA256, SHA3-256) to hashlib names (sha1, sha256, sha3_256).
+        algorithm = algorithm.lower()
+        algorithm = algorithm.replace("-", "_") if algorithm.startswith("sha3") else algorithm.replace("-", "")
+        assert hashlib.new(algorithm, stored).hexdigest() == digest.lower()
     compression = image.get("compression", "").split(":")
     codec = compression[0].split("+")[0]
     raw = stored

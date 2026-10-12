@@ -177,13 +177,58 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(h["LONGSTRN"], "OGIP 1.0")
 
     def test_unicode_and_comment_truncation_reported(self):
-        fixture(self.src, keywords=[("FOCNAME", "'Observer’s focuser'", "é"), ("OBJECT", "'" + "x"*65 + "'", "comment" * 30)])
+        fixture(self.src, keywords=[("FOCNAME", "'Observer’s focuser'", "é"), ("OBJECT", "'" + "x"*65 + "'", "comment" * 30),
+                                   ("TELESCOP", "'Bob’s “scope” – 70mm'", ""), ("HISTORY", "tab\there", "")])
         r = self.convert("--verify")
-        self.assertIn("ASCII-normalized keyword: FOCNAME", r.stderr)
-        self.assertIn("truncated header comment", r.stderr)
+        # Typographic quotes and dashes have exact equivalents; only lossy
+        # replacements are reported, once per file.
+        self.assertIn("ASCII-normalized keywords (lossy): FOCNAME, HISTORY\n", r.stderr)
+        self.assertEqual(r.stderr.count("ASCII-normalized"), 1)
+        self.assertIn("NOTE: header comments shortened to fit 80-character cards in 1 file", r.stderr)
         h = self.check_fits()
         self.assertEqual(h["FOCNAME"], "Observer's focuser")
+        self.assertEqual(h["TELESCOP"], 'Bob\'s "scope" - 70mm')
         self.assertEqual(h["OBJECT"], "x"*65)
+
+    def test_truncated_comments_summarized(self):
+        keywords = [("OBJECT", "'" + "x" * 60 + "'", "object comment " * 3),
+                    ("XISF.IMAGE.LONGNAME", "'value'", "hierarch comment " * 4),
+                    ("LONGSTR", "'" + "s" * 150 + "'", "continued comment " * 4),
+                    # The value fills the card, so the comment is dropped entirely.
+                    ("FULL", "'" + "f" * 68 + "'", "dropped"),
+                    ("SHORT", "1", "fits")]
+        fixture(self.src, keywords=keywords)
+        # Truncation is expected on real frames: one note per run, not a warning.
+        r = self.convert("--verify")
+        self.assertEqual(r.stderr, "NOTE: header comments shortened to fit 80-character cards in 1 file "
+                                   "(values intact; --verbose lists keywords)\n")
+        h = self.check_fits()
+        self.assertEqual(h["LONGSTR"], "s" * 150)
+        self.assertEqual(h.comments["SHORT"], "fits")
+        r = self.convert("--verify", "--overwrite", "--verbose")
+        self.assertEqual(r.stderr.splitlines(), [
+            f"NOTE {str(self.src)!r}: truncated header comments: OBJECT, XISF.IMAGE.LONGNAME, LONGSTR, FULL".replace("'", '"'),
+            "NOTE: header comments shortened to fit 80-character cards in 1 file (values intact)"])
+        fixture(self.src, keywords=[("SHORT", "1", "fits")])
+        self.assertEqual(self.convert("--verify", "--overwrite", "--verbose").stderr, "")
+        # In a batch, the note counts successful files; --verbose lists each file's own keywords.
+        batch = self.root / "batch"
+        fixture(batch / "a.xisf", keywords=[("OBJECT", "'" + "x" * 60 + "'", "a" * 30)])
+        fixture(batch / "b.xisf", keywords=[("FILTER", "'" + "x" * 60 + "'", "b" * 30), ("SHORT", "1", "fits")])
+        fixture(batch / "c.xisf", keywords=[("SHORT", "1", "fits")])
+        fixture(batch / "d.xisf", keywords=[("OBJECT", "'" + "x" * 60 + "'", "d" * 30)], bad_checksum=True)
+        r = self.run_converter("--dry-run", batch, self.root / "batch-out")
+        self.assertIn("in 3 files", r.stderr)  # Dry runs do not check source hashes.
+        r = self.run_converter("--verify", batch, self.root / "batch-out", expected=1)
+        self.assertEqual(r.stderr.count("NOTE"), 1)
+        self.assertIn("NOTE: header comments shortened to fit 80-character cards in 2 files", r.stderr)
+        r = self.run_converter("--verify", "--verbose", batch, self.root / "batch-out", expected=1)
+        notes = sorted(l for l in r.stderr.splitlines() if "truncated header comments" in l)
+        # d.xisf fails its source checksum before its metadata is prepared.
+        self.assertEqual(len(notes), 2, r.stderr)
+        self.assertTrue(notes[0].endswith('a.xisf": truncated header comments: OBJECT'), notes)
+        self.assertTrue(notes[1].endswith('b.xisf": truncated header comments: FILTER'), notes)
+        self.assertIn("in 2 files (values intact)", r.stderr)
 
     def test_properties_precision_and_conflicts(self):
         props = [("IMAGE", "Instrument:Telescope:Aperture", "Float32", "0.07", "[m] aperture"),
@@ -207,6 +252,29 @@ class ConversionTests(unittest.TestCase):
         self.assertIn("property conflicts with FOCUSPOS", r.stderr)
         self.assertIn("omitted unsupported property SomeVector", r.stderr)
         self.assertIn("omitted XISF image element: Resolution", r.stderr)
+
+    def test_known_benign_property_differences(self):
+        # N.I.N.A. writes Instrument:Focuser:Position as 0; a TimePoint's Z and
+        # trailing fractional zeros do not change DATE-OBS.
+        keywords = [("SWCREATE", "'N.I.N.A. 3.1.2.9001 (x64)'", ""), ("FOCUSPOS", "3200", ""),
+                    ("DATE-OBS", "'2023-11-17T18:15:09.635'", "")]
+        props = [("IMAGE", "Instrument:Focuser:Position", "Float32", "0", ""),
+                 ("IMAGE", "Observation:Time:Start", "TimePoint", "2023-11-17T18:15:09.6350Z", "")]
+        fixture(self.src, keywords=keywords, properties=props)
+        r = self.convert("--verify")
+        self.assertNotIn("conflicts", r.stderr)
+        h = self.check_fits()
+        self.assertEqual((h["FOCUSPOS"], h["XISF.IMAGE.INSTRUMENT.FOCUSER.POSITION"]), (3200, 0.0))
+        self.assertEqual(h["XISF.IMAGE.OBSERVATION.TIME.START"], "2023-11-17T18:15:09.6350Z")
+        # Real differences are still reported: a nonzero NINA focuser property,
+        # another time, and the zero focuser property from other software.
+        for kw, prop, name in [(keywords, [("IMAGE", "Instrument:Focuser:Position", "Float32", "3100", "")], "FOCUSPOS"),
+                               (keywords, [("IMAGE", "Observation:Time:Start", "TimePoint", "2023-11-17T18:15:09.636Z", "")], "DATE-OBS"),
+                               (keywords[1:], props[:1], "FOCUSPOS")]:
+            with self.subTest(name=name, prop=prop):
+                fixture(self.src, keywords=kw, properties=prop)
+                r = self.convert("--verify", "--overwrite")
+                self.assertIn(f"property conflicts with {name}", r.stderr)
 
     def test_keyword_and_property_collisions_fail(self):
         for kwargs in [dict(keywords=[("OBJECT", "A", ""), ("OBJECT", "B", "")]),
@@ -356,6 +424,59 @@ class ConversionTests(unittest.TestCase):
         h = self.check_fits(PIXELS[:2])
         self.assertEqual((h["BAYERPAT"], h["XBAYROFF"]), ("GRBG", 0))
 
+    def test_zero_bayer_offsets_without_pattern(self):
+        for offsets in ([("XBAYROFF", "0", ""), ("YBAYROFF", "+000", "")], [("XBAYEROFF", "-0", "")],
+                        [("XBAYROFF", "0", ""), ("YBAYROFF", "0", ""), ("XBAYEROFF", "0", ""), ("YBAYEROFF", "-0", "")]):
+            with self.subTest(offsets=offsets):
+                fixture(self.src, keywords=offsets)
+                r = self.convert("--verify", "--overwrite")
+                names = ", ".join(name for name, _, _ in offsets)
+                self.assertIn(f"omitted zero Bayer offsets without a pattern: {names}\n", r.stderr)
+                h = self.check_fits()
+                for name, _, _ in offsets:
+                    self.assertNotIn(name, h)
+                self.assertNotIn("BAYERPAT", h)
+                self.run_converter("--dry-run", self.src, self.root / "dry.fits.fz")
+        fixture(self.src, keywords=[("SHORT", "1", "")])
+        self.assertNotIn("Bayer", self.convert("--overwrite").stderr)
+
+    def test_invalid_bayer_offsets_and_patterns_fail(self):
+        extra = [("ColorFilterArray", {"width": "2", "height": "2", "pattern": "RGGB"})]
+        cases = [  # Nonzero offsets need BAYERPAT, even when their parity is zero.
+            dict(keywords=[("XBAYROFF", "1", "")]), dict(keywords=[("YBAYROFF", "2", "")]),
+            dict(keywords=[("XBAYROFF", "-2", "")]), dict(keywords=[("XBAYROFF", "9" * 30, "")]),
+            dict(keywords=[("XBAYROFF", "0", ""), ("XBAYEROFF", "2", "")]),
+            dict(keywords=[("XBAYROFF", "0.0", "")]), dict(keywords=[("YBAYROFF", "'0'", "")]),
+            dict(keywords=[("YBAYROFF", "2", "")], extra=extra), dict(keywords=[("XBAYROFF", "-2", "")], extra=extra),
+            dict(keywords=[("XBAYROFF", "0", ""), ("XBAYEROFF", "2", "")], extra=extra),
+            dict(keywords=[("BAYERPAT", "'RGGB'", ""), ("XBAYROFF", "T", "")]),
+            # A present but empty pattern must not replace an XML CFA.
+            dict(keywords=[("BAYERPAT", "''", "")]), dict(keywords=[("BAYERPAT", "'    '", "")]),
+            dict(keywords=[("BAYERPAT", "", "")]),
+            dict(keywords=[("BAYERPAT", "''", "")], extra=extra), dict(keywords=[("BAYERPAT", "'  '", "")], extra=extra),
+            dict(keywords=[("BAYERPAT", "", "")], extra=extra)]
+        for case in cases:
+            with self.subTest(case=case):
+                self.out.unlink(missing_ok=True)
+                fixture(self.src, pixels=PIXELS[:2], **case)
+                self.run_converter("--overwrite", self.src, self.out, expected=1)
+                self.run_converter("--dry-run", self.src, self.root / "dry.fits.fz", expected=1)
+                self.assertFalse(self.out.exists())
+
+    def test_xml_cfa_zero_offsets_and_bayerpat_parity(self):
+        extra = [("ColorFilterArray", {"width": "2", "height": "2", "pattern": "RGGB"})]
+        fixture(self.src, pixels=PIXELS[:2], extra=extra,
+                keywords=[("XBAYROFF", "+0", ""), ("YBAYROFF", "-0", ""), ("XBAYEROFF", "000", "")])
+        self.convert("--verify", "--overwrite")
+        h = self.check_fits(PIXELS[:2])
+        self.assertEqual((h["BAYERPAT"], h["XBAYROFF"], h["YBAYROFF"]), ("RGGB", 0, 0))
+        self.assertNotIn("XBAYEROFF", h)
+        # With BAYERPAT, even nonzero offsets shift nothing and large tokens are not narrowed.
+        fixture(self.src, pixels=PIXELS[:2], keywords=[("BAYERPAT", "'RGGB'", ""), ("XBAYROFF", "-2", ""),
+                                                       ("YBAYROFF", "9" * 30, ""), ("YBAYEROFF", "1", "")])
+        self.convert("--verify", "--overwrite")
+        self.assertEqual(self.check_fits(PIXELS[:2])["BAYERPAT"], "GBRG")
+
     def test_source_continue_cards(self):
         fixture(self.src, keywords=[("OBJECT", "'first&'", ""), ("CONTINUE", "' second&'", ""),
                                    ("CONTINUE", "' O''Brien'", "source comment")])
@@ -405,7 +526,7 @@ class ConversionTests(unittest.TestCase):
         src = fixture(self.root / "-input.xisf")
         self.run_converter("--verify", "--", src.name, "-output.fits.fz", cwd=self.root)
         self.check_fits(path=self.root / "-output.fits.fz")
-        self.assertIn("0.2.0", self.run_converter("--version").stdout)
+        self.assertRegex(self.run_converter("--version").stdout, r"^xisf2fits \d+\.\d+\.\d+\n$")
 
     def test_failed_overwrite_preserves_output(self):
         fixture(self.src)

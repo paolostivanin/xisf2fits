@@ -5,11 +5,11 @@ losslessly Rice-compressed FITS (`.fits.fz`). It supports raw mono and 2×2 Baye
 frames, including old N.I.N.A. files with unquoted text metadata. Source files
 are never modified.
 
-Version 0.2 fixes invalid legacy NINA headers, missing commentary/properties,
-unchecked source corruption, and unsafe filename interpretation. Existing FITS
-files produced by 0.1 should be regenerated from their XISFs with
-`--overwrite --verify`. See [the review](docs/REVIEW.md) for the findings and
-validation results, and [the follow-up triage](docs/FIXES.md) for later fixes.
+Version 0.4 reduces diagnostics on real NINA archives to actionable warnings
+and tightens Bayer metadata checks; outputs are otherwise unchanged from 0.3.
+Existing FITS files produced by 0.1 should be regenerated from their XISFs with
+`--overwrite --verify`. See [fixes and open issues](docs/FIXES.md) for release
+notes.
 
 ## Build
 
@@ -54,6 +54,7 @@ path; directory symlinks are not followed.
 | `--dry-run` | Validate source headers, block bounds, metadata representability, and planned destinations without writing files or decoding pixels. Source block hashes are **not** checked. Attached string properties are deferred until conversion. |
 | `--overwrite` | Replace an existing output after successful conversion and optional output verification. |
 | `--row-order ORDER` | `top-down` (default) or `bottom-up`. Repeated options use the last value. |
+| `--verbose` | For each file, list the keywords whose header comments were shortened. |
 | `--version` | Print the program version. |
 | `-h`, `--help` | Print help. |
 | `--` | End option parsing; subsequent arguments are filenames. |
@@ -103,10 +104,14 @@ them and writes `ROWORDER='BOTTOM-UP'`. Row reversal is rejected when WCS or
 distortion keywords are present. Ordinary NINA pointing hints such as RA, DEC,
 and EQUINOX are retained. Supported Bayer patterns are normalized to the first
 output pixel, with zero `XBAYROFF`/`YBAYROFF`; reversal accounts for image-height
-parity. Trailing blanks in `BAYERPAT` are ignored. An XML `ColorFilterArray`
-already describes the first stored pixel: FITS offsets apply only to `BAYERPAT`,
-so a nonzero offset with an XML CFA and no `BAYERPAT` is ambiguous and fails.
-Conflicting XML/FITS CFA descriptions or unsupported patterns fail.
+parity. Trailing blanks in `BAYERPAT` are ignored; an empty, blank, or undefined
+`BAYERPAT` fails. An XML `ColorFilterArray` already describes the first stored
+pixel: FITS offsets apply only to `BAYERPAT`, so with an XML CFA and no
+`BAYERPAT`, zero offsets are accepted and any nonzero offset (even `2`) is
+ambiguous and fails. Without any pattern, offsets (`XBAYROFF`, `YBAYROFF`,
+`XBAYEROFF`, `YBAYEROFF`) that are all zero are omitted with one warning, and a
+nonzero offset fails. Conflicting XML/FITS CFA descriptions, non-integer
+offsets, or unsupported patterns fail.
 
 ## Metadata contract
 
@@ -131,18 +136,27 @@ Conflicting XML/FITS CFA descriptions or unsupported patterns fail.
   preserve their FITS real type. Full timestamp precision is retained. Existing
   capture keywords are not overwritten by properties. Conflicts are reported
   and both values remain available; a property may be stale even when its FITS
-  keyword is correct. Property-name collisions fail.
+  keyword is correct. A TimePoint matches `DATE-OBS` regardless of its trailing
+  `Z` and insignificant fractional zeros. N.I.N.A. 3.x always writes
+  `Instrument:Focuser:Position` as 0, so when `SWCREATE` names N.I.N.A. a zero
+  value is retained without a conflict warning; `FOCUSPOS` holds the real
+  position. Property-name collisions fail.
   Nonfinite or out-of-range numeric properties are rejected.
 - Structural, scaling, null, compression-table, and checksum keywords are
   regenerated or excluded. Descriptive `EXTNAME` is retained. Custom NAXIS/ZNAXIS
   lookalike names are moved under `HIERARCH XISF.FITS.*`, with a warning, because
   strict readers can otherwise misinterpret them as axis definitions.
 
-FITS headers are ASCII. Curly quotes/dashes are normalized; other unsupported
-characters become `?`, and control whitespace becomes spaces. Every affected
-keyword is reported. Keyword comments can be truncated to the available card
-space, with a warning; values are never silently truncated. FITS readers may
-ignore insignificant trailing string spaces.
+FITS headers are ASCII. Curly quotes and dashes are normalized to their ASCII
+equivalents without a warning; other unsupported characters become `?`, and
+control whitespace becomes spaces. Keywords affected by these lossy
+replacements are listed in one warning per file. Keyword comments can be
+truncated or dropped to fit the available card space. Every NINA frame has some,
+mostly on long `HIERARCH XISF.*` property names whose matching capture keywords
+keep the full comment, so this is not a warning: one `NOTE` per run counts the
+affected files, and `--verbose` lists each file's keywords. Values are never
+silently truncated. FITS readers may ignore insignificant trailing string
+spaces.
 
 Vectors, matrices, complex **properties**, properties that cannot fit even using
 HIERARCH, thumbnails, ICC profiles, display settings, and other unsupported XML
@@ -222,14 +236,11 @@ Windows is not supported.
 
 ## Known issues
 
-- Real NINA frames produce many `truncated header comment` warnings (about a
-  dozen per file), one per affected card. Values are never truncated.
 - Some filesystems and network mounts reject `fsync` on a directory with
   `EINVAL`. The file is then reported as failed even though the complete output
   was already published; `--verify` on a rerun confirms it.
 - A single unrepresentable value fails the whole file rather than omitting that
-  value: for example a NaN numeric property, or an `XBAYROFF`/`YBAYROFF` of zero
-  without a Bayer pattern.
+  value: for example a NaN numeric property.
 - The decoded image size is bounded only by its declared geometry and the
   exact-size checks, not by an application memory budget. A small compressed
   block declaring a very large image can allocate accordingly before its

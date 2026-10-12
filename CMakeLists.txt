@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(xisf2fits VERSION 0.3.0 LANGUAGES CXX)
+project(xisf2fits VERSION 0.4.0 LANGUAGES CXX)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)

@@ -43,11 +43,28 @@ std::string decodeLiteral(const std::string& raw) {
     }
     return value;
 }
-void normalize(Card& card, Metadata& metadata) {
+void normalize(Card& card, std::vector<std::string>& lossy) {
     bool changed = false;
     card.value = ascii(card.value, changed);
     card.comment = ascii(card.comment, changed);
-    if (changed) metadata.warnings.push_back("ASCII-normalized keyword: " + card.name);
+    const auto name = card.name.empty() ? "(blank)" : card.name;
+    if (changed && std::find(lossy.begin(), lossy.end(), name) == lossy.end()) lossy.push_back(name);
+}
+std::string join(const std::vector<std::string>& names) {
+    std::string result;
+    for (const auto& name : names) result += (result.empty() ? "" : ", ") + name;
+    return result;
+}
+// FITS DATE-OBS has no zone designator and XISF TimePoints end in Z; trailing
+// fractional zeros are insignificant.
+std::string timePoint(std::string value) {
+    value = trim(value);
+    if (!value.empty() && (value.back() == 'Z' || value.back() == 'z')) value.pop_back();
+    if (value.find('.') != std::string::npos) {
+        value.erase(value.find_last_not_of('0') + 1);
+        if (value.back() == '.') value.pop_back();
+    }
+    return value;
 }
 bool numeric(ValueType t) { return t == ValueType::Integer || t == ValueType::Real; }
 ValueType numberType(const std::string& value) {
@@ -126,8 +143,9 @@ Card parseKeyword(const Keyword& keyword) {
 Metadata prepareMetadata(const Source& source, bool bottomUp) {
     Metadata metadata;
     std::map<std::string, size_t> indexes;
+    std::vector<std::string> lossy;
     auto add = [&](Card card) {
-        normalize(card, metadata);
+        normalize(card, lossy);
         if (card.type != ValueType::Commentary) {
             prefix(card.name);
             auto existing = indexes.find(card.name);
@@ -193,6 +211,8 @@ Metadata prepareMetadata(const Source& source, bool bottomUp) {
         {"Observation:Center:RA", {"RA", 1}}, {"Observation:Center:Dec", {"DEC", 1}},
         {"Observation:Equinox", {"EQUINOX", 1}}
     };
+    const auto creator = indexes.find("SWCREATE");
+    const bool nina = creator != indexes.end() && metadata.cards[creator->second].value.find("N.I.N.A.") != std::string::npos;
     std::set<std::string> propertyNames;
     for (const auto& property : source.properties) {
         auto id = upper(property.id);
@@ -258,8 +278,12 @@ Metadata prepareMetadata(const Source& source, bool bottomUp) {
             if (numeric(old.type) && numeric(card.type)) {
                 const auto a = number(old.value), b = number(card.value) * alias->second.second;
                 equal = std::fabs(a - b) <= 1e-12L * std::max({1.0L, std::fabs(a), std::fabs(b)});
-            }
-            if (!equal) metadata.warnings.push_back("property conflicts with " + old.name + ": " + property.id + "; retained both");
+            } else if (property.type == "TimePoint" && old.type == ValueType::String)
+                equal = timePoint(old.value) == timePoint(card.value);
+            // N.I.N.A. 3.x writes this property as 0 whatever the focuser
+            // position; the FOCUSPOS keyword holds the real value.
+            const bool ninaFocuser = nina && property.id == "Instrument:Focuser:Position" && number(card.value) == 0;
+            if (!equal && !ninaFocuser) metadata.warnings.push_back("property conflicts with " + old.name + ": " + property.id + "; retained both");
         }
         add(std::move(card));
     }
@@ -274,9 +298,18 @@ Metadata prepareMetadata(const Source& source, bool bottomUp) {
         // Trailing blanks are insignificant in FITS strings; CFITSIO pads to 8.
         pattern = upper(patternCard->value);
         pattern.erase(pattern.find_last_not_of(' ') + 1);
+        // An empty pattern would otherwise replace the XML CFA and be written as ''.
+        if (patternCard->type != ValueType::String || pattern.empty()) fail("invalid Bayer pattern");
     }
+    bool nonzero = false, offsets = false;
+    for (const char* name : {"XBAYROFF", "YBAYROFF", "XBAYEROFF", "YBAYEROFF"})
+        if (const auto* card = find(name)) {
+            if (card->type != ValueType::Integer) fail("invalid Bayer offset");
+            // Check the token, not its parity: 2 and -2 are nonzero offsets.
+            nonzero |= card->value.find_first_not_of("+-0") != std::string::npos;
+            offsets = true;
+        }
     auto parity = [](const Card* card) {
-        if (card->type != ValueType::Integer) fail("invalid Bayer offset");
         // Only parity matters; avoid narrowing arbitrary integer strings.
         return (card->value.back() - '0') % 2;
     };
@@ -287,30 +320,39 @@ Metadata prepareMetadata(const Source& source, bool bottomUp) {
         return c ? parity(c) : 0;
     };
     const int x = offset("XBAYROFF", "XBAYEROFF"), y = offset("YBAYROFF", "YBAYEROFF");
+    auto bayerCard = [](const Card& c) {
+        return c.name == "BAYERPAT" || c.name == "XBAYROFF" || c.name == "YBAYROFF" || c.name == "XBAYEROFF" || c.name == "YBAYEROFF";
+    };
     if (!pattern.empty()) {
         static const std::set<std::string> patterns = {"RGGB", "BGGR", "GRBG", "GBRG"};
         if (!patterns.count(pattern) || (!source.cfa.empty() && !patterns.count(source.cfa))) fail("unsupported Bayer pattern");
         // An XML CFA already describes the first stored pixel; FITS offsets
         // apply only to BAYERPAT. Without it, a nonzero offset is ambiguous.
-        if (!patternCard && (x || y)) fail("Bayer offsets are ambiguous with an XML CFA and no BAYERPAT");
+        if (!patternCard && nonzero) fail("Bayer offsets are ambiguous with an XML CFA and no BAYERPAT");
         std::string effective = pattern;
         for (int row = 0; row < 2; ++row)
             for (int col = 0; col < 2; ++col) effective[row * 2 + col] = pattern[((row + y) % 2) * 2 + (col + x) % 2];
         if (patternCard && !source.cfa.empty() && effective != source.cfa) fail("XML CFA conflicts with FITS Bayer metadata");
         if (bottomUp && source.height % 2 == 0) effective = effective.substr(2) + effective.substr(0, 2);
-        metadata.cards.erase(std::remove_if(metadata.cards.begin(), metadata.cards.end(), [](const Card& c) {
-            return c.name == "BAYERPAT" || c.name == "XBAYROFF" || c.name == "YBAYROFF" || c.name == "XBAYEROFF" || c.name == "YBAYEROFF";
-        }), metadata.cards.end());
+        metadata.cards.erase(std::remove_if(metadata.cards.begin(), metadata.cards.end(), bayerCard), metadata.cards.end());
         metadata.cards.push_back({"BAYERPAT", effective, "Bayer pattern at first output pixel", ValueType::String});
         metadata.cards.push_back({"XBAYROFF", "0", "Bayer X offset in output", ValueType::Integer});
         metadata.cards.push_back({"YBAYROFF", "0", "Bayer Y offset in output", ValueType::Integer});
-    } else if (find("XBAYROFF") || find("YBAYROFF") || find("XBAYEROFF") || find("YBAYEROFF")) fail("Bayer offsets without a pattern");
+    } else if (offsets) {
+        if (nonzero) fail("Bayer offsets without a pattern");
+        std::vector<std::string> names;
+        for (const auto& card : metadata.cards) if (bayerCard(card)) names.push_back(card.name);
+        metadata.warnings.push_back("omitted zero Bayer offsets without a pattern: " + join(names));
+        metadata.cards.erase(std::remove_if(metadata.cards.begin(), metadata.cards.end(), bayerCard), metadata.cards.end());
+    }
+    if (!lossy.empty()) metadata.warnings.push_back("ASCII-normalized keywords (lossy): " + join(lossy));
     metadata.cards.push_back({"ROWORDER", bottomUp ? "BOTTOM-UP" : "TOP-DOWN", "Pixel row order in output image", ValueType::String});
     return metadata;
 }
 
 std::vector<std::string> headerRecords(Metadata& metadata) {
     std::vector<std::string> records;
+    auto& truncated = metadata.truncatedComments;
     bool longStrings = false;
     auto emit = [&](std::string record) {
         if (record.size() > 80) fail("internal FITS card overflow");
@@ -319,7 +361,8 @@ std::vector<std::string> headerRecords(Metadata& metadata) {
     auto comment = [&](std::string record, const Card& card) {
         if (!card.comment.empty()) {
             const size_t available = record.size() + 3 <= 80 ? 80 - record.size() - 3 : 0;
-            if (card.comment.size() > available) metadata.warnings.push_back("truncated header comment: " + card.name);
+            if (card.comment.size() > available && std::find(truncated.begin(), truncated.end(), card.name) == truncated.end())
+                truncated.push_back(card.name);
             if (available) record += " / " + card.comment.substr(0, available);
         }
         emit(std::move(record));

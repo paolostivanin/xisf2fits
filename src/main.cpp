@@ -9,8 +9,9 @@ namespace {
 using namespace x2f;
 struct Options {
     fs::path input, output;
-    bool verify = false, dryRun = false, overwrite = false, bottomUp = false;
+    bool verify = false, dryRun = false, overwrite = false, bottomUp = false, verbose = false;
 };
+size_t truncatedFiles = 0;
 void usage() {
     std::cout << R"(xisf2fits - convert UInt16 camera XISF images to Rice-compressed FITS
 
@@ -24,6 +25,7 @@ Usage:
                     decoding pixels, or checking source block hashes.
   --overwrite       Replace existing outputs only after successful conversion.
   --row-order ORDER top-down (default) or bottom-up; reject WCS row flips.
+  --verbose         List the keywords whose header comments were shortened.
   --version         Print program version.
   -h, --help        Show this help.
   --                End option parsing (allows filenames beginning with '-').
@@ -49,6 +51,7 @@ Options parse(int argc, char** argv) {
         else if (arg == "--verify") options.verify = true;
         else if (arg == "--dry-run") options.dryRun = true;
         else if (arg == "--overwrite") options.overwrite = true;
+        else if (arg == "--verbose") options.verbose = true;
         else if (arg == "--row-order") {
             if (++i >= argc) fail("--row-order requires top-down or bottom-up");
             const std::string order = argv[i];
@@ -88,9 +91,17 @@ Outcome convert(const fs::path& input, const fs::path& output, const Options& op
     auto records = headerRecords(metadata);
     for (const auto& warning : source.warnings) std::cerr << "WARNING " << input << ": " << warning << '\n';
     for (const auto& warning : metadata.warnings) std::cerr << "WARNING " << input << ": " << warning << '\n';
+    const bool truncated = !metadata.truncatedComments.empty();
+    if (truncated && options.verbose) {
+        std::cerr << "NOTE " << input << ": truncated header comments:";
+        for (size_t i = 0; i < metadata.truncatedComments.size(); ++i)
+            std::cerr << (i ? ", " : " ") << metadata.truncatedComments[i];
+        std::cerr << '\n';
+    }
     if (options.dryRun) {
         std::cout << (exists && !options.overwrite ? "WOULD VERIFY " : "WOULD CONVERT ") << input << " -> " << output
                   << " [source hashes not checked]\n";
+        truncatedFiles += truncated;
         return Outcome::Planned;
     }
     if (exists && !options.overwrite) {
@@ -98,6 +109,7 @@ Outcome convert(const fs::path& input, const fs::path& output, const Options& op
         catch (const Cancelled&) { throw; }
         catch (const std::exception& error) { fail(std::string(error.what()) + "; regenerate using --overwrite --verify"); }
         std::cout << "SKIPPED " << input << ": existing output verified\n";
+        truncatedFiles += truncated;
         return Outcome::Skipped;
     }
     TemporaryOutput temporary(output);
@@ -108,6 +120,7 @@ Outcome convert(const fs::path& input, const fs::path& output, const Options& op
     if (source.imageChecksumVerified) std::cout << " [source checksum verified]";
     if (options.verify) std::cout << " [output verified]";
     std::cout << '\n';
+    truncatedFiles += truncated;
     return Outcome::Converted;
 }
 
@@ -130,6 +143,14 @@ void collect(const fs::path& root, std::vector<fs::path>& inputs, size_t& failed
         }
     }
 }
+// Comments are cut to fit 80-character cards on every NINA frame; values never
+// are. Report this once per run so that actionable warnings remain visible.
+void reportTruncation(bool verbose) {
+    if (!truncatedFiles) return;
+    std::cerr << "NOTE: header comments shortened to fit 80-character cards in " << truncatedFiles
+              << (truncatedFiles == 1 ? " file" : " files") << " (values intact"
+              << (verbose ? ")" : "; --verbose lists keywords)") << '\n';
+}
 void handleSignal(int signal) { interrupted = signal; }
 }
 
@@ -146,6 +167,7 @@ int main(int argc, char** argv) {
             if (name.size() < 8 || name.substr(name.size() - 8) != ".FITS.FZ") fail("output filename must end in .fits.fz");
             convert(options.input, output, options, false);
             checkpoint();
+            reportTruncation(options.verbose);
             return 0;
         }
         if (!fs::is_directory(options.input)) fail("input must be a regular file or directory");
@@ -182,6 +204,7 @@ int main(int argc, char** argv) {
             catch (const Unsupported& error) { std::cout << "SKIPPED " << input << ": " << error.what() << '\n'; ++skipped; }
             catch (const std::exception& error) { std::cerr << "FAILED " << input << ": " << error.what() << '\n'; ++failed; }
         }
+        reportTruncation(options.verbose);
         std::cout << "Summary: " << (options.dryRun ? planned : converted) << (options.dryRun ? " planned" : " converted")
                   << ", " << skipped << " skipped, " << failed << " failed\n";
         return failed ? 1 : 0;
