@@ -140,7 +140,7 @@ Card parseKeyword(const Keyword& keyword) {
     return card;
 }
 
-Metadata prepareMetadata(const Source& source, bool bottomUp) {
+Metadata prepareMetadata(const Image& image, bool bottomUp, bool named) {
     Metadata metadata;
     std::map<std::string, size_t> indexes;
     std::vector<std::string> lossy;
@@ -160,8 +160,8 @@ Metadata prepareMetadata(const Source& source, bool bottomUp) {
         }
         metadata.cards.push_back(std::move(card));
     };
-    for (size_t i = 0; i < source.keywords.size(); ++i) {
-        const auto& keyword = source.keywords[i];
+    for (size_t i = 0; i < image.keywords.size(); ++i) {
+        const auto& keyword = image.keywords[i];
         auto name = upper(trim(keyword.name));
         if (name.rfind("HIERARCH ", 0) == 0) name = trim(name.substr(9));
         if (bottomUp && wcsKeyword(name)) fail("cannot flip rows of an image with FITS WCS keywords");
@@ -177,8 +177,8 @@ Metadata prepareMetadata(const Source& source, bool bottomUp) {
         } else {
             auto card = parseKeyword(keyword);
             while (card.type == ValueType::String && !card.value.empty() && card.value.back() == '&' &&
-                   i + 1 < source.keywords.size() && upper(trim(source.keywords[i + 1].name)) == "CONTINUE") {
-                auto next = parseKeyword(source.keywords[++i]);
+                   i + 1 < image.keywords.size() && upper(trim(image.keywords[i + 1].name)) == "CONTINUE") {
+                auto next = parseKeyword(image.keywords[++i]);
                 if (next.type != ValueType::String) fail("non-string source CONTINUE card");
                 card.value.pop_back();
                 card.value += next.value;
@@ -195,6 +195,8 @@ Metadata prepareMetadata(const Source& source, bool bottomUp) {
             add(std::move(card));
         }
     }
+    // Name each extension of a multi-image file after its XISF image.
+    if (named && !image.id.empty() && !indexes.count("EXTNAME")) add({"EXTNAME", image.id, "XISF image id", ValueType::String});
 
     // Property values retain their XML decimal representation, not a rounded
     // libXISF Variant or a reformatted double. Ordinary capture keys stay intact.
@@ -214,7 +216,7 @@ Metadata prepareMetadata(const Source& source, bool bottomUp) {
     const auto creator = indexes.find("SWCREATE");
     const bool nina = creator != indexes.end() && metadata.cards[creator->second].value.find("N.I.N.A.") != std::string::npos;
     std::set<std::string> propertyNames;
-    for (const auto& property : source.properties) {
+    for (const auto& property : image.properties) {
         auto id = upper(property.id);
         std::replace(id.begin(), id.end(), ':', '.');
         Card card{"XISF." + property.scope + "." + id, property.value, property.comment, ValueType::String};
@@ -277,7 +279,10 @@ Metadata prepareMetadata(const Source& source, bool bottomUp) {
             bool equal = old.value == card.value;
             if (numeric(old.type) && numeric(card.type)) {
                 const auto a = number(old.value), b = number(card.value) * alias->second.second;
-                equal = std::fabs(a - b) <= 1e-12L * std::max({1.0L, std::fabs(a), std::fabs(b)});
+                // PixInsight widens Float32 values into Float64 properties
+                // (0.07000000029802322) and writes keywords to Float32
+                // precision (349.99999): compare to 1 ppm, a few Float32 ulps.
+                equal = std::fabs(a - b) <= 1e-6L * std::max({1.0L, std::fabs(a), std::fabs(b)});
             } else if (property.type == "TimePoint" && old.type == ValueType::String)
                 equal = timePoint(old.value) == timePoint(card.value);
             // N.I.N.A. 3.x writes this property as 0 whatever the focuser
@@ -293,7 +298,7 @@ Metadata prepareMetadata(const Source& source, bool bottomUp) {
         return it == indexes.end() ? nullptr : &metadata.cards[it->second];
     };
     const auto* patternCard = find("BAYERPAT");
-    std::string pattern = source.cfa;
+    std::string pattern = image.cfa;
     if (patternCard) {
         // Trailing blanks are insignificant in FITS strings; CFITSIO pads to 8.
         pattern = upper(patternCard->value);
@@ -325,15 +330,15 @@ Metadata prepareMetadata(const Source& source, bool bottomUp) {
     };
     if (!pattern.empty()) {
         static const std::set<std::string> patterns = {"RGGB", "BGGR", "GRBG", "GBRG"};
-        if (!patterns.count(pattern) || (!source.cfa.empty() && !patterns.count(source.cfa))) fail("unsupported Bayer pattern");
+        if (!patterns.count(pattern) || (!image.cfa.empty() && !patterns.count(image.cfa))) fail("unsupported Bayer pattern");
         // An XML CFA already describes the first stored pixel; FITS offsets
         // apply only to BAYERPAT. Without it, a nonzero offset is ambiguous.
         if (!patternCard && nonzero) fail("Bayer offsets are ambiguous with an XML CFA and no BAYERPAT");
         std::string effective = pattern;
         for (int row = 0; row < 2; ++row)
             for (int col = 0; col < 2; ++col) effective[row * 2 + col] = pattern[((row + y) % 2) * 2 + (col + x) % 2];
-        if (patternCard && !source.cfa.empty() && effective != source.cfa) fail("XML CFA conflicts with FITS Bayer metadata");
-        if (bottomUp && source.height % 2 == 0) effective = effective.substr(2) + effective.substr(0, 2);
+        if (patternCard && !image.cfa.empty() && effective != image.cfa) fail("XML CFA conflicts with FITS Bayer metadata");
+        if (bottomUp && image.height % 2 == 0) effective = effective.substr(2) + effective.substr(0, 2);
         metadata.cards.erase(std::remove_if(metadata.cards.begin(), metadata.cards.end(), bayerCard), metadata.cards.end());
         metadata.cards.push_back({"BAYERPAT", effective, "Bayer pattern at first output pixel", ValueType::String});
         metadata.cards.push_back({"XBAYROFF", "0", "Bayer X offset in output", ValueType::Integer});

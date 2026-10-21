@@ -28,11 +28,17 @@ PIXELS = np.array([[0, 1, 255, 256], [32767, 32768, 65534, 65535], [17, 312, 100
 def fixture(path, pixels=PIXELS, keywords=(), properties=(), codec=None, shuffle=False,
             subblocks=False, checksum="sha-256", bad_checksum=False, location="attachment",
             image_attrs=None, extra=(), raw_override=None, payload_override=None, siblings=()):
-    """Write an XISF envelope directly, independently of converter/libXISF code."""
-    pixels = np.asarray(pixels, dtype=np.uint16)
-    raw = pixels.astype("<u2").tobytes() if raw_override is None else raw_override
+    """Write an XISF envelope directly, independently of converter/libXISF code.
+
+    float32 pixels make a Float32 image. A sibling with "pixels" is stored as its
+    own checksummed attachment after the first image's block."""
+    pixels = np.asarray(pixels)
+    if pixels.dtype != np.float32:
+        pixels = pixels.astype(np.uint16)
+    item = pixels.dtype.itemsize
+    raw = pixels.astype(pixels.dtype.newbyteorder("<")).tobytes() if raw_override is None else raw_override
     if shuffle:
-        raw = raw[0::2] + raw[1::2]
+        raw = b"".join(raw[i::item] for i in range(item))
     def compress(data):
         if codec in ("lz4", "lz4hc"):
             return lz4.block.compress(data, store_size=False, mode="high_compression" if codec == "lz4hc" else "default")
@@ -44,9 +50,9 @@ def fixture(path, pixels=PIXELS, keywords=(), properties=(), codec=None, shuffle
     chunks = [raw[:len(raw)//2], raw[len(raw)//2:]] if subblocks else [raw]
     compressed = [compress(chunk) for chunk in chunks]
     stored = b"".join(compressed) if payload_override is None else payload_override
-    attrs = {"geometry": f"{pixels.shape[1]}:{pixels.shape[0]}:1", "sampleFormat": "UInt16", "colorSpace": "Gray"}
+    attrs = {"geometry": f"{pixels.shape[1]}:{pixels.shape[0]}:1", "sampleFormat": sample_format(pixels), "colorSpace": "Gray"}
     if codec:
-        attrs["compression"] = codec + ("+sh" if shuffle else "") + f":{pixels.size * 2}" + (":2" if shuffle else "")
+        attrs["compression"] = codec + ("+sh" if shuffle else "") + f":{pixels.size * item}" + (f":{item}" if shuffle else "")
     if subblocks:
         attrs["subblocks"] = ":".join(f"{len(c)},{len(r)}" for c, r in zip(compressed, chunks))
     if checksum:
@@ -59,7 +65,18 @@ def fixture(path, pixels=PIXELS, keywords=(), properties=(), codec=None, shuffle
     attrs.update(image_attrs or {})
     root = ET.Element("xisf", version="1.0", xmlns=NS)
     image = ET.SubElement(root, "Image", attrs)
+    blocks = []
     for attributes in siblings:
+        attributes = dict(attributes)
+        data = attributes.pop("pixels", None)
+        if data is not None:
+            assert location == "attachment"
+            block = data.astype(data.dtype.newbyteorder("<")).tobytes()
+            offset = 16384 + len(stored) + sum(map(len, blocks))
+            attributes = {"geometry": f"{data.shape[1]}:{data.shape[0]}:1", "sampleFormat": sample_format(data),
+                          "colorSpace": "Gray", "location": f"attachment:{offset}:{len(block)}",
+                          "checksum": "sha-256:" + hashlib.sha256(block).hexdigest(), **attributes}
+            blocks.append(block)
         ET.SubElement(root, "Image", attributes)
     if location == "inline:base64":
         image.text = base64.b64encode(stored).decode()
@@ -84,8 +101,12 @@ def fixture(path, pixels=PIXELS, keywords=(), properties=(), codec=None, shuffle
     assert location != "attachment" or len(header) <= 16384
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(header + (b"\0" * (16384 - len(header)) + stored if location == "attachment" else b""))
+    path.write_bytes(header + (b"\0" * (16384 - len(header)) + stored + b"".join(blocks) if location == "attachment" else b""))
     return path
+
+
+def sample_format(pixels):
+    return "Float32" if pixels.dtype == np.float32 else "UInt16"
 
 
 class ConversionTests(unittest.TestCase):
@@ -107,20 +128,35 @@ class ConversionTests(unittest.TestCase):
         return self.run_converter(*options, self.src, self.out)
 
     def check_fits(self, expected=PIXELS, path=None):
+        return self.check_images([np.asarray(expected)], path)[0]
+
+    def check_images(self, expected, path=None):
+        """Check one image extension per expected array; return their headers."""
         path = path or self.out
         # Check physical table HDU checksums as well as the virtual image header.
         with fits.open(path, disable_image_compression=True, checksum=True) as hdus:
             hdus.verify("exception")
-            self.assertEqual(len(hdus), 2)
+            self.assertEqual(len(hdus), len(expected) + 1)
             for hdu in hdus:
                 self.assertEqual(hdu.verify_checksum(), 1)
                 self.assertEqual(hdu.verify_datasum(), 1)
-            self.assertEqual(hdus[1].header["ZCMPTYPE"], "RICE_1")
+            for hdu, pixels in zip(hdus[1:], expected):
+                if pixels.dtype == np.float32:
+                    self.assertEqual(hdu.header["ZCMPTYPE"], "GZIP_2")
+                    self.assertEqual(hdu.header["ZQUANTIZ"], "NONE")
+                else:
+                    self.assertEqual(hdu.header["ZCMPTYPE"], "RICE_1")
         with fits.open(path, uint=True) as hdus:
             hdus.verify("exception")
-            self.assertEqual(hdus[1].data.dtype, np.dtype("uint16"))
-            np.testing.assert_array_equal(hdus[1].data, expected)
-            return hdus[1].header.copy()
+            for hdu, pixels in zip(hdus[1:], expected):
+                if pixels.dtype == np.float32:
+                    # Bitwise: signed zeros, denormals and NaN payloads must survive.
+                    self.assertEqual(hdu.data.dtype.kind + str(hdu.data.dtype.itemsize), "f4")
+                    np.testing.assert_array_equal(np.asarray(hdu.data, dtype="=f4").view("=u4"), pixels.view("=u4"))
+                else:
+                    self.assertEqual(hdu.data.dtype, np.dtype("uint16"))
+                    np.testing.assert_array_equal(hdu.data, pixels)
+            return [hdu.header.copy() for hdu in hdus[1:]]
 
     def test_compression_and_storage_matrix(self):
         for codec in (None, "zlib", "lz4", "lz4hc", "zstd"):
@@ -514,8 +550,80 @@ class ConversionTests(unittest.TestCase):
         for name in ("CTYPE1", "CRPIX2A", "CD1_2", "PC3_2", "A_ORDER", "WCSAXES"):
             fixture(self.src, keywords=[(name, "'RA---TAN'" if name == "CTYPE1" else "1", "")])
             self.run_converter("--row-order", "bottom-up", self.src, self.out, expected=1)
-        fixture(self.src, properties=[("IMAGE", "PCL:AstrometricSolution:ProjectionSystem", "String", "TAN", "")])
-        self.run_converter(self.src, self.out, expected=1)
+        # A native PixInsight solution cannot become FITS WCS: it is omitted
+        # whole, with one warning, and the rest of the metadata is kept.
+        fixture(self.src, properties=[("IMAGE", "PCL:AstrometricSolution:ProjectionSystem", "String", "TAN", ""),
+                                      ("IMAGE", "PCL:AstrometricSolution:ReferenceImageCoordinates", "F64Vector", "", ""),
+                                      ("IMAGE", "Instrument:Telescope:Aperture", "Float64", "0.07", "")])
+        r = self.run_converter("--verify", self.src, self.out)
+        self.assertEqual(r.stderr, f"WARNING {str(self.src)!r}: omitted PixInsight astrometric solution "
+                                   "(2 properties); no FITS WCS is written\n".replace("'", '"'))
+        h = self.check_fits()
+        self.assertFalse([key for key in h if "ASTROMETRIC" in key])
+        self.assertEqual(h["XISF.IMAGE.INSTRUMENT.TELESCOPE.APERTURE"], 0.07)
+
+    def test_float32_master(self):
+        # A PixInsight master: the Float32 result, then its rejection maps.
+        integration = np.array([[0.0, -0.0, 1.0, 0.4426], [np.nan, 1e-45, 0.25, 0.5], [3e-3, 0.75, 1 / 3, 0.125]],
+                               dtype=np.float32)
+        low = np.zeros((3, 4), dtype=np.float32)
+        low[1, 2] = 0.25
+        high = np.zeros((3, 4), dtype=np.float32)
+        high[0, 0] = 0.5
+        keywords = [("IMAGETYP", "'Master Flat'", "Type of image"), ("BAYERPAT", "'RGGB'", ""),
+                    ("HISTORY", "", "ImageIntegration.pixelRejection = WinsorizedSigmaClip")]
+        properties = [("IMAGE", "Instrument:Telescope:Aperture", "Float64", "0.07", ""),
+                      ("FILE", "XISF:CreatorApplication", "String", "PixInsight 1.8.9-2", "")]
+        siblings = [{"id": "rejection_low", "pixels": low}, {"id": "rejection_high", "pixels": high}]
+        for codec, shuffle in ((None, False), ("zlib", True), ("lz4", False)):
+            with self.subTest(codec=codec, shuffle=shuffle):
+                fixture(self.src, pixels=integration, codec=codec, shuffle=shuffle, keywords=keywords,
+                        properties=properties, image_attrs={"id": "integration", "bounds": "0:1"}, siblings=siblings)
+                r = self.convert("--verify", "--overwrite")
+                self.assertIn("[3 images] [source checksum verified] [output verified]", r.stdout)
+                self.assertEqual(r.stderr, "")
+                headers = self.check_images([integration, low, high])
+                self.assertEqual([h["EXTNAME"] for h in headers], ["integration", "rejection_low", "rejection_high"])
+                # Metadata belongs to the result; the maps carry only their names.
+                self.assertEqual(headers[0]["IMAGETYP"], "Master Flat")
+                self.assertEqual(headers[0]["BAYERPAT"], "RGGB")
+                self.assertEqual(headers[0]["XISF.IMAGE.INSTRUMENT.TELESCOPE.APERTURE"], 0.07)
+                self.assertEqual(headers[0]["XISF.FILE.XISF.CREATORAPPLICATION"], "PixInsight 1.8.9-2")
+                for h in headers[1:]:
+                    self.assertFalse([key for key in h if key in ("IMAGETYP", "BAYERPAT", "HISTORY") or key.startswith("XISF.")])
+                self.assertEqual([h["ROWORDER"] for h in headers], ["TOP-DOWN"] * 3)
+        self.convert("--verify", "--overwrite", "--row-order", "bottom-up")
+        headers = self.check_images([integration[::-1], low[::-1], high[::-1]])
+        self.assertEqual([h["ROWORDER"] for h in headers], ["BOTTOM-UP"] * 3)
+        self.assertEqual(headers[0]["BAYERPAT"], "RGGB")  # Odd height: the first output row keeps its phase.
+
+        # A batch rerun verifies every extension against the source.
+        srcdir, outdir = self.root / "masters", self.root / "masters-out"
+        fixture(srcdir / "master.xisf", pixels=integration, image_attrs={"id": "integration"}, siblings=siblings)
+        r = self.run_converter("--dry-run", srcdir, outdir)
+        self.assertIn("[3 images] [source hashes not checked]", r.stdout)
+        self.run_converter("--verify", srcdir, outdir)
+        self.assertIn("existing output verified", self.run_converter("--verify", srcdir, outdir).stdout)
+        changed = high.copy()
+        changed[2, 3] = 0.75
+        fixture(srcdir / "master.xisf", pixels=integration, image_attrs={"id": "integration"},
+                siblings=[siblings[0], {"id": "rejection_high", "pixels": changed}])
+        r = self.run_converter("--verify", srcdir, outdir, expected=1)
+        self.assertIn("pixel mismatch in HDU 4 (rejection_high) at output x=3, y=2", r.stderr)
+        fixture(srcdir / "master.xisf", pixels=integration, image_attrs={"id": "integration"}, siblings=siblings[:1])
+        r = self.run_converter("--verify", srcdir, outdir, expected=1)
+        self.assertIn("expected 3 FITS HDUs, found 4", r.stderr)
+
+    def test_float32_single_image(self):
+        pixels = np.array([[0.5, -0.0, np.inf], [1.0, 0.0, -1.5]], dtype=np.float32)
+        fixture(self.src, pixels=pixels, image_attrs={"id": "integration"}, checksum=None)
+        r = self.convert("--verify")
+        self.assertIn("source image checksum absent", r.stderr)
+        self.assertNotIn("images]", r.stdout)
+        # A single image is not renamed after its id.
+        self.assertNotEqual(self.check_fits(pixels).get("EXTNAME"), "integration")
+        fixture(self.src, pixels=pixels, codec="zstd", shuffle=True, image_attrs={"compression": "zstd+sh:24:2"})
+        self.assertIn("invalid Float32 shuffle item size", self.run_converter("--overwrite", self.src, self.out, expected=1).stderr)
 
     def test_literal_filenames(self):
         for name in ("bracket[1]", "paren(template)", "!bang", "file.gz", "brace{1}", "space ' quote"):
@@ -586,17 +694,25 @@ class ConversionTests(unittest.TestCase):
         fixture(srcdir / "a.XISF")
         fixture(srcdir / "rgb.xisf", image_attrs={"colorSpace": "RGB"})
         fixture(srcdir / "good.xisf")
-        sibling = {"geometry": "4:3:1", "colorSpace": "Gray", "location": "attachment:16384:24"}
-        fixture(srcdir / "master.xisf", image_attrs={"id": "integration", "sampleFormat": "Float32"},
-                siblings=[{**sibling, "id": "rejection_low", "sampleFormat": "Float32"}])
-        fixture(srcdir / "pair.xisf", image_attrs={"id": "a"}, siblings=[{**sibling, "id": "b", "sampleFormat": "UInt16"}])
+        floats = PIXELS.astype(np.float32) / 65535
+        fixture(srcdir / "master.xisf", pixels=floats, image_attrs={"id": "integration"},
+                siblings=[{"id": "rejection_low", "pixels": floats}])
+        fixture(srcdir / "pair.xisf", image_attrs={"id": "a"}, siblings=[{"id": "b", "pixels": PIXELS}])
+        # Every image must be single-channel Gray, and all of one sample format.
+        fixture(srcdir / "rgbmaster.xisf", pixels=floats, image_attrs={"id": "integration"},
+                siblings=[{"id": "rgb", "pixels": floats, "colorSpace": "RGB"}])
+        fixture(srcdir / "mixed.xisf", image_attrs={"id": "a"}, siblings=[{"id": "b", "pixels": floats}])
         r = self.run_converter("--verify", srcdir, outdir, expected=1)
         self.assertIn("destination collision", r.stderr)
-        self.assertIn("PixInsight integration master (integration Float32, rejection_low Float32)", r.stdout)
-        self.assertIn("multi-image XISF (a UInt16, b UInt16)", r.stdout)
-        self.assertIn("3 skipped, 2 failed", r.stdout)
+        self.assertIn("expected single-channel UInt16 or Float32 Gray image", r.stdout)
+        self.assertIn("PixInsight integration master (integration Float32, rgb RGB Float32); every image must be "
+                      "single-channel UInt16 or Float32 Gray, of one format", r.stdout)
+        self.assertIn("multi-image XISF (a UInt16, b Float32)", r.stdout)
+        self.assertIn("3 converted, 3 skipped, 2 failed", r.stdout)
         self.assertFalse((outdir / "a.fits.fz").exists())
         self.check_fits(path=outdir / "good.fits.fz")
+        self.check_images([floats, floats], outdir / "master.fits.fz")
+        self.check_images([PIXELS, PIXELS], outdir / "pair.fits.fz")
 
     def test_batch_case_collision(self):
         srcdir, outdir = self.root / "sources", self.root / "outputs"

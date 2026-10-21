@@ -18,13 +18,13 @@ struct Options {
 };
 std::atomic<size_t> truncatedFiles{0};
 void usage() {
-    std::cout << R"(xisf2fits - convert UInt16 camera XISF images to Rice-compressed FITS
+    std::cout << R"(xisf2fits - convert XISF images to losslessly compressed FITS
 
 Usage:
   xisf2fits [OPTIONS] INPUT.xisf OUTPUT.fits.fz
   xisf2fits [OPTIONS] INPUT_DIRECTORY OUTPUT_DIRECTORY
 
-  --verify          Verify pixels, null masks, metadata, and both HDU checksums.
+  --verify          Verify pixels, null masks, metadata, and every HDU checksum.
                     In batches, verify existing outputs before skipping them.
   --dry-run         Validate headers and destinations without writing outputs,
                     decoding pixels, or checking source block hashes.
@@ -37,10 +37,13 @@ Usage:
   -h, --help        Show this help.
   --                End option parsing (allows filenames beginning with '-').
 
-Declared source checksums are always checked during conversion, even without
---verify. Missing source checksums and metadata omissions are reported.
+UInt16 camera frames are Rice-compressed. Float32 images, such as PixInsight
+masters, are GZIP_2-compressed without quantization. Each XISF image becomes
+one image extension; extensions of multi-image files are named after their
+image ids. Declared source checksums are always checked during conversion, even
+without --verify. Missing source checksums and metadata omissions are reported.
 Scalar XISF properties are retained as HIERARCH XISF.IMAGE.* / XISF.FILE.*
-keywords on the compressed image HDU. Unsupported image formats are skipped
+keywords on the (first) compressed image HDU. Unsupported formats are skipped
 in batches. Invalid data fails. Exit status: 0 success, 1 failure, 128+signal
 on interruption. Sources are never modified.
 )";
@@ -99,19 +102,28 @@ Outcome convert(const fs::path& input, const fs::path& output, const Options& op
         return Outcome::Skipped;
     }
     auto source = readSource(input, options.dryRun);
-    auto metadata = prepareMetadata(source, options.bottomUp);
-    auto records = headerRecords(metadata);
-    for (const auto& warning : source.warnings) err << "WARNING " << input << ": " << warning << '\n';
-    for (const auto& warning : metadata.warnings) err << "WARNING " << input << ": " << warning << '\n';
-    const bool truncated = !metadata.truncatedComments.empty();
-    if (truncated && options.verbose) {
-        err << "NOTE " << input << ": truncated header comments:";
-        for (size_t i = 0; i < metadata.truncatedComments.size(); ++i)
-            err << (i ? ", " : " ") << metadata.truncatedComments[i];
-        err << '\n';
+    const bool multiple = source.images.size() > 1;
+    std::vector<std::vector<std::string>> records;
+    std::vector<std::string> warnings = source.warnings, truncatedNotes;
+    for (size_t i = 0; i < source.images.size(); ++i) {
+        const auto& image = source.images[i];
+        auto metadata = prepareMetadata(image, options.bottomUp, multiple);
+        records.push_back(headerRecords(metadata));
+        const auto label = multiple ? "image " + (image.id.empty() ? "#" + std::to_string(i + 1) : image.id) + ": " : "";
+        for (const auto& warning : metadata.warnings) warnings.push_back(label + warning);
+        if (metadata.truncatedComments.empty()) continue;
+        std::string note = label + "truncated header comments:";
+        for (size_t j = 0; j < metadata.truncatedComments.size(); ++j)
+            note += (j ? ", " : " ") + metadata.truncatedComments[j];
+        truncatedNotes.push_back(note);
     }
+    for (const auto& warning : warnings) err << "WARNING " << input << ": " << warning << '\n';
+    const bool truncated = !truncatedNotes.empty();
+    if (options.verbose)
+        for (const auto& note : truncatedNotes) err << "NOTE " << input << ": " << note << '\n';
+    const std::string images = multiple ? " [" + std::to_string(source.images.size()) + " images]" : "";
     if (options.dryRun) {
-        out << (exists && !options.overwrite ? "WOULD VERIFY " : "WOULD CONVERT ") << input << " -> " << output
+        out << (exists && !options.overwrite ? "WOULD VERIFY " : "WOULD CONVERT ") << input << " -> " << output << images
             << " [source hashes not checked]\n";
         truncatedFiles += truncated;
         return Outcome::Planned;
@@ -128,8 +140,9 @@ Outcome convert(const fs::path& input, const fs::path& output, const Options& op
     writeFits(temporary.file, source, options.bottomUp, records);
     if (options.verify) verifyFits(temporary.file, source, options.bottomUp, records);
     publish(temporary.file, output, options.overwrite);
-    out << "CONVERTED " << input << " -> " << output;
-    if (source.imageChecksumVerified) out << " [source checksum verified]";
+    out << "CONVERTED " << input << " -> " << output << images;
+    if (std::all_of(source.images.begin(), source.images.end(), [](const Image& image) { return image.checksumVerified; }))
+        out << " [source checksum verified]";
     if (options.verify) out << " [output verified]";
     out << '\n';
     truncatedFiles += truncated;

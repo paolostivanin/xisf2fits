@@ -1,5 +1,7 @@
 #include "converter.hpp"
 
+#include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <unistd.h>
@@ -20,10 +22,14 @@ bool hasCard(const Metadata& metadata, const std::string& name) {
     for (const auto& card : metadata.cards) if (card.name == name) return true;
     return false;
 }
-Source frame(std::vector<Keyword> keywords, std::vector<Property> properties = {}, std::string cfa = {}) {
-    Source source; source.width = 2; source.height = 2;
-    source.keywords = std::move(keywords); source.properties = std::move(properties); source.cfa = std::move(cfa);
-    return source;
+Image frame(std::vector<Keyword> keywords, std::vector<Property> properties = {}, std::string cfa = {}) {
+    Image image; image.width = 2; image.height = 2;
+    image.keywords = std::move(keywords); image.properties = std::move(properties); image.cfa = std::move(cfa);
+    return image;
+}
+std::vector<std::string> recordsFor(const Image& image, bool named) {
+    auto metadata = prepareMetadata(image, false, named);
+    return headerRecords(metadata);
 }
 std::string contents(const fs::path& p) { std::ifstream f(p); return {std::istreambuf_iterator<char>(f), {}}; }
 void put(const fs::path& p, const std::string& s) { std::ofstream f(p); f << s; }
@@ -46,10 +52,11 @@ int main() {
         require(wcsKeyword("CRPIX2A") && wcsKeyword("PC3_2") && wcsKeyword("A_ORDER"), "WCS recognition");
         require(!wcsKeyword("RA") && !wcsKeyword("EQUINOX"), "pointing hints do not prohibit flips");
 
-        Source source; source.width = 2; source.height = 2;
-        source.keywords = {{"FOCUSPOS", "2946", ""}, {"COMMENT", "", "important"}};
-        source.properties = {{"IMAGE", "Instrument:Focuser:Position", "Float32", "0", ""}};
-        auto metadata = prepareMetadata(source, false);
+        Source source; source.images.resize(1);
+        auto& image = source.images[0]; image.width = 2; image.height = 2;
+        image.keywords = {{"FOCUSPOS", "2946", ""}, {"COMMENT", "", "important"}};
+        image.properties = {{"IMAGE", "Instrument:Focuser:Position", "Float32", "0", ""}};
+        auto metadata = prepareMetadata(image, false);
         require(!metadata.warnings.empty(), "conflicting property reported");
         metadata.cards.push_back({"LONG", std::string(150, '\'') + "&", "comment", ValueType::String});
         auto records = headerRecords(metadata);
@@ -79,6 +86,13 @@ int main() {
                 "TimePoint zone designator and fractional zeros are insignificant");
         require(warned(prepareMetadata(frame({dateObs}, {{"IMAGE", "Observation:Time:Start", "TimePoint", "2023-11-17T18:15:09.636Z", ""}}), false), "conflicts with DATE-OBS"),
                 "different TimePoint conflicts");
+        // PixInsight masters: Float32 values widened to Float64 properties.
+        const Property aperture{"IMAGE", "Instrument:Telescope:Aperture", "Float64", "0.07000000029802322", ""};
+        const Property focal{"IMAGE", "Instrument:Telescope:FocalLength", "Float64", "0.3499999940395355", ""};
+        require(!warned(prepareMetadata(frame({{"APTDIA", "70", ""}, {"FOCALLEN", "349.99999", ""}}, {aperture, focal}), false), "conflicts"),
+                "Float32 rounding is not a conflict");
+        require(warned(prepareMetadata(frame({{"FOCALLEN", "346.5", ""}}, {focal}), false), "conflicts with FOCALLEN"),
+                "a different focal length conflicts");
 
         // Lossy ASCII replacements are listed once per file, not once per card.
         auto lossyMetadata = prepareMetadata(frame({{"FOCNAME", "'caf\xC3\xA9'", ""}, {"OBJECT", "'M\xC3\xA9'", ""},
@@ -123,6 +137,15 @@ int main() {
         headerRecords(intact);
         require(intact.truncatedComments.empty(), "no truncation recorded when every comment fits");
 
+        // Extensions of multi-image files are named after their image ids.
+        auto master = frame({{"SHORT", "1", ""}}); master.id = "rejection_low";
+        require(!hasCard(prepareMetadata(master, false), "EXTNAME"), "single images get no EXTNAME");
+        auto extname = prepareMetadata(master, false, true);
+        require(hasCard(extname, "EXTNAME") && extname.cards[1].value == "rejection_low", "image id becomes EXTNAME");
+        master.keywords.push_back({"extname", "'SCI'", ""});
+        for (const auto& card : prepareMetadata(master, false, true).cards)
+            require(card.name != "EXTNAME" || card.value == "SCI", "an existing EXTNAME is kept");
+
         std::string pattern = (fs::temp_directory_path() / "xisf2fits-unit-XXXXXX").string();
         require(::mkdtemp(pattern.data()), "temporary test directory");
         const fs::path root = pattern;
@@ -153,13 +176,13 @@ int main() {
         for (const auto& entry : fs::directory_iterator(root))
             require(entry.path().filename().string().rfind(".xisf2fits-", 0) != 0, "temporary directory cleaned up");
 
-        source.pixels = {0, 32768, 1, 65535};
+        image.pixels = {0, 32768, 1, 65535};
         const auto valid = root / "verify.fits.fz";
-        writeFits(valid, source, false, records);
-        verifyFits(valid, source, false, records);
-        source.pixels[0] = 1;
-        rejects([&] { verifyFits(valid, source, false, records); }, "pixel verification rejects altered source");
-        source.pixels[0] = 0;
+        writeFits(valid, source, false, {records});
+        verifyFits(valid, source, false, {records});
+        image.pixels[0] = 1;
+        rejects([&] { verifyFits(valid, source, false, {records}); }, "pixel verification rejects altered source");
+        image.pixels[0] = 0;
         // Recompute checksums after a malicious BLANK insertion: checksum-only
         // verification must not conceal null interpretation of real pixels.
         fitsfile* f = nullptr; int status = 0, type = 0;
@@ -170,7 +193,33 @@ int main() {
         fits_write_chksum(f, &status);
         fits_close_file(f, &status);
         checkFits(status, "create null interpretation regression");
-        rejects([&] { verifyFits(valid, source, false, records); }, "reject null interpretation with valid checksums");
+        rejects([&] { verifyFits(valid, source, false, {records}); }, "reject null interpretation with valid checksums");
+
+        // Float32 extensions are lossless: signed zero, denormals, NaN payloads
+        // and infinities survive bit for bit, and a null check cannot hide them.
+        const uint32_t bits[6] = {0x80000000u, 0x00000001u, 0x7fc12345u, 0x7f800000u, 0xff800000u, 0x3ee28f5cu};
+        Source floats; floats.images.resize(2);
+        for (size_t i = 0; i < 2; ++i) {
+            auto& f = floats.images[i];
+            f.id = i ? "rejection_low" : "integration"; f.width = 3; f.height = 2; f.float32 = true;
+            f.samples.resize(6);
+            std::memcpy(f.samples.data(), bits, sizeof bits);
+            if (i) std::reverse(f.samples.begin(), f.samples.end());
+        }
+        const std::vector<std::vector<std::string>> floatRecords{recordsFor(floats.images[0], true), recordsFor(floats.images[1], true)};
+        const auto lossless = root / "float.fits.fz";
+        for (bool bottomUp : {false, true}) {
+            fs::remove(lossless);
+            writeFits(lossless, floats, bottomUp, floatRecords);
+            verifyFits(lossless, floats, bottomUp, floatRecords);
+        }
+        rejects([&] { verifyFits(lossless, floats, false, floatRecords); }, "row order is verified on float images");
+        auto zero = floats;
+        uint32_t positive = 0; std::memcpy(&zero.images[1].samples[5], &positive, sizeof positive);
+        rejects([&] { verifyFits(lossless, zero, true, floatRecords); }, "-0.0 and +0.0 differ in the second extension");
+        Source fewer; fewer.images = {floats.images[0]};
+        rejects([&] { verifyFits(lossless, fewer, true, {floatRecords[0]}); }, "extension count is verified");
+        rejects([&] { verifyFits(valid, floats, false, floatRecords); }, "UInt16 output does not verify as Float32");
         std::cout << "unit tests passed\n";
         return 0;
     } catch (const std::exception& error) {

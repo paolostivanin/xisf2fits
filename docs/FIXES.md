@@ -3,8 +3,45 @@
 The conversion contract is in README.md. This file records what changed in
 each release and the design decisions for issues that remain open.
 
-## Unreleased
+## 0.5.0
 
+Checked against the 12,984-file reference archive: all 141 PixInsight masters,
+previously skipped, convert and verify. A dry run prints 61 warnings, all about
+masters, and camera-frame outputs are unchanged from 0.4.
+
+- **PixInsight masters are converted.** The reference archive's 141 masters
+  (14 bias, 20 dark, 95 flat, 12 light) were skipped. Every one is a
+  multi-image XISF of single-channel Float32 images: `integration` plus
+  `rejection_low` and often `rejection_high`, one adds a `slope_map`, and the
+  masterLights carry a drizzle `weightImage` or an autocrop `crop_mask` beside
+  `integration_autocrop`. Each XISF image now becomes one compressed image
+  extension, in document order, named after its id (`EXTNAME`). The result is
+  HDU 2 with all of the file's metadata; the maps carry only their names.
+  Float32 images are GZIP_2-compressed with quantization disabled
+  (`ZQUANTIZ='NONE'`), because CFITSIO's default float compression is lossy,
+  and `--verify` compares them bit for bit. All images in a file must share one
+  sample format, because CFITSIO's compression settings apply to the whole
+  file; RGB and mixed files are still skipped. Single-image UInt16 output is
+  unchanged: 0.4 outputs of real NINA frames still verify, and fresh outputs
+  have identical headers. With 8 jobs and `--verify`, all 141 masters
+  converted in 3 minutes, from 34.5 GB of XISF to 10.7 GB of FITS: the result
+  images shrink 1.4–2.7 times, and the rejection maps, mostly zeros, almost
+  vanish. `tests/validate_archive.py` now also checks one master per layout,
+  every pixel of every image compared bitwise.
+- **PixInsight astrometric solutions are omitted, not rejected.** Nine
+  masterLights carry a `PCL:AstrometricSolution` (spline transformations
+  stored as vector and matrix properties) and failed. The solution, including
+  its scalar members, is now left out as a whole with one warning per file;
+  plate-solve the FITS image again if WCS is needed.
+- **Float32 rounding is no longer a property conflict.** PixInsight widens
+  Float32 values into Float64 properties (`Instrument:Telescope:Aperture` =
+  `0.07000000029802322` beside `APTDIA = 70`) and writes keywords to Float32
+  precision (`FOCALLEN = 349.99999`). Numeric properties now match their
+  capture keyword within 1 ppm instead of 1e-12, which removed 243 of the 277
+  conflict warnings a dry run printed for the masters. The rest are real
+  differences: 32 masters have an empty `FILTER` beside a named
+  `Instrument:Filter:Name`, and 2 masterLights have a refined focal length
+  rounded to six digits.
 - **`-j`/`--jobs N` converts files in parallel in directory mode.** The default
   stays at 1; `0` uses every hardware thread. On the reference archive's
   single hard disk, 8 jobs converted cold NINA frames with `--verify` 4.4

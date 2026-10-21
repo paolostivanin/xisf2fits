@@ -29,14 +29,22 @@ uint64_t unsignedNumber(const std::string& value, const std::string& context);
 
 struct Keyword { std::string name, value, comment; };
 struct Property { std::string scope, id, type, value, comment; };
-struct Source {
+struct Image {
+    std::string id;
     uint64_t width = 0, height = 0;
-    std::vector<uint16_t> pixels;
+    bool float32 = false;
+    std::vector<uint16_t> pixels;  // UInt16 samples
+    std::vector<float> samples;    // Float32 samples, compared bitwise
     std::vector<Keyword> keywords;
+    // The first image also holds the container (FILE) properties, after its own.
     std::vector<Property> properties;
     std::string cfa;
+    bool checksumVerified = false;
+};
+// One compressed FITS image extension per XISF image, in document order.
+struct Source {
+    std::vector<Image> images;
     std::vector<std::string> warnings;
-    bool imageChecksumVerified = false;
 };
 // libxml2, CFITSIO and OpenSSL initialize lazily, which is not thread-safe:
 // call this once before starting worker threads.
@@ -59,15 +67,17 @@ bool structuralKeyword(const std::string& name);
 bool wcsKeyword(const std::string& name);
 ValueType scalarType(const std::string& value);
 Card parseKeyword(const Keyword& keyword);
-Metadata prepareMetadata(const Source& source, bool bottomUp);
+// named: add EXTNAME from the image id, for multi-image sources.
+Metadata prepareMetadata(const Image& image, bool bottomUp, bool named = false);
 // The serialized records are also the verification contract: ordering, types,
 // complete numeric tokens and comments must survive without CFITSIO coercion.
 std::vector<std::string> headerRecords(Metadata& metadata);
 
+// records[i] holds the header records of source.images[i].
 void writeFits(const fs::path& path, const Source& source, bool bottomUp,
-               const std::vector<std::string>& records);
+               const std::vector<std::vector<std::string>>& records);
 void verifyFits(const fs::path& path, const Source& source, bool bottomUp,
-                const std::vector<std::string>& records);
+                const std::vector<std::vector<std::string>>& records);
 void publish(const fs::path& temporary, const fs::path& output, bool overwrite);
 void syncPath(const fs::path& path, bool directory);
 

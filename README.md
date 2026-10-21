@@ -1,12 +1,14 @@
 # xisf2fits
 
-`xisf2fits` converts single-image, unsigned 16-bit grayscale camera XISFs to
-losslessly Rice-compressed FITS (`.fits.fz`). It supports raw mono and 2×2 Bayer
-frames, including old N.I.N.A. files with unquoted text metadata. Source files
-are never modified.
+`xisf2fits` converts grayscale XISFs to losslessly compressed FITS (`.fits.fz`):
+unsigned 16-bit camera frames with Rice, and 32-bit float images such as
+PixInsight masters with GZIP_2 and no quantization. It supports raw mono and
+2×2 Bayer frames, including old N.I.N.A. files with unquoted text metadata, and
+multi-image masters with their rejection, weight, crop, or slope maps. Source
+files are never modified.
 
-Version 0.4 reduces diagnostics on real NINA archives to actionable warnings
-and tightens Bayer metadata checks; outputs are otherwise unchanged from 0.3.
+Version 0.5 converts PixInsight masters and adds `--jobs` for parallel batches.
+Camera frames convert exactly as in 0.4, and 0.4 outputs still pass `--verify`.
 Existing FITS files produced by 0.1 should be regenerated from their XISFs with
 `--overwrite --verify`. See [fixes and open issues](docs/FIXES.md) for release
 notes.
@@ -51,7 +53,7 @@ path; directory symlinks are not followed.
 
 | Option | Behavior |
 | --- | --- |
-| `--verify` | Reread output pixels and null masks; check dimensions, unsigned scaling, Rice compression, metadata, and checksums in both HDUs. In a batch, verify existing outputs before skipping them. |
+| `--verify` | Reread output pixels and null masks; check dimensions, pixel scaling, compression, metadata, and checksums in every HDU. Float32 pixels are compared bit for bit. In a batch, verify existing outputs before skipping them. |
 | `--dry-run` | Validate source headers, block bounds, metadata representability, and planned destinations without writing files or decoding pixels. Source block hashes are **not** checked. Attached string properties are deferred until conversion. |
 | `--overwrite` | Replace an existing output after successful conversion and optional output verification. |
 | `--row-order ORDER` | `top-down` (default) or `bottom-up`. Repeated options use the last value. |
@@ -62,7 +64,10 @@ path; directory symlinks are not followed.
 | `--` | End option parsing; subsequent arguments are filenames. |
 
 Conversion is CPU-bound, about 0.7 s per 6252×4176 frame with `--verify` on
-one core. Each job needs about 150 MB of memory for such a frame. With more
+one core. Each job needs about 150 MB of memory for such a frame. A master
+is held in memory with all of its images: 8 jobs converting the reference
+archive's 141 masters (2–4 Float32 images of up to 6252×4176) used 2.5 GB at
+most, and took 3 minutes with `--verify`. With more
 than one job, files finish out of order, but each file's warnings and result
 are printed together. On a single hard disk, reads limit the gain: reading
 NINA frames from one 7200 rpm disk, 8 jobs were 4.4 times faster than one, and
@@ -75,10 +80,10 @@ or mismatched outputs; it does not repair them automatically. Verification
 compares the converter's canonical metadata records, so an externally edited
 header with different formatting can require regeneration even if values match.
 
-Unsupported sample formats, RGB images, and multi-image containers are skipped
-in batches. A multi-image skip lists each image's id and sample format, and
-names PixInsight integration masters, which carry rejection, weight, or crop
-maps beside the Float32 result. Malformed data is a failure. Directory-access failures are reported
+Images other than single-channel Gray UInt16 or Float32, such as RGB images,
+and multi-image files mixing sample formats are skipped in batches. A
+multi-image skip lists each image's id, color space if not Gray, and sample
+format, and names PixInsight integration masters. Malformed data is a failure. Directory-access failures are reported
 while other directories continue. Inputs mapping to the same destination are
 reported as collisions before either is converted. Destinations differing only
 in ASCII letter case (`M31/a.xisf` and `m31/a.xisf`) also collide, even on
@@ -90,7 +95,8 @@ file/directory failed, otherwise `0`; interruption returns `128 + signal`.
 
 Supported storage: attachment, inline base64/base16, and embedded data;
 uncompressed, zlib, LZ4, LZ4HC, or Zstandard; compressed subblocks and byte
-shuffling. Only little-endian UInt16, single-channel Gray images are accepted.
+shuffling. Only little-endian, single-channel Gray UInt16 or Float32 images are
+accepted, and all images in a file must share one sample format.
 The XML header, including inline and embedded blocks, is limited to 64 MiB, and
 decoded string properties to 64 MiB in total. DTDs and external data locations
 are rejected.
@@ -105,13 +111,26 @@ error. An image without a checksum produces a warning: comparing decoded pixels
 with FITS cannot establish whether the source was already damaged. Source hashes
 do not authenticate the XML metadata.
 
-Each output contains an empty primary HDU and a compressed image extension.
-Metadata is on **HDU 2**, alongside `BITPIX=16`, `BZERO=32768`, and `BSCALE=1`.
-Do not inspect only the empty primary header. New FITS `CHECKSUM`/`DATASUM` cards
-are written for both HDUs.
+Each output contains an empty primary HDU and one compressed image extension
+per XISF image, in document order. Metadata is on **HDU 2**: the first image's
+keywords and properties, and the container properties. Do not inspect only the
+empty primary header. UInt16 images are Rice-compressed with `BITPIX=16`,
+`BZERO=32768`, and `BSCALE=1`. Float32 images are GZIP_2-compressed
+(byte-shuffled gzip) with `ZQUANTIZ='NONE'`: CFITSIO's default float
+compression quantizes values, which is lossy, so it is disabled, and every bit
+is kept, including signed zeros, denormals, and NaN payloads. New FITS
+`CHECKSUM`/`DATASUM` cards are written for every HDU.
+
+In a multi-image file, each extension is named after its image
+(`EXTNAME = 'integration'`, `'rejection_low'`, …) unless the image has its own
+`EXTNAME`. A PixInsight master's result is HDU 2, which FITS readers open by
+default; its maps follow, carrying only their name and `ROWORDER`.
+Single-image outputs get no added `EXTNAME`. The XISF `bounds` of float images
+(`0:1` in PixInsight masters) are not recorded; FITS readers commonly assume
+that range for float data.
 
 Rows remain in XISF order by default (`ROWORDER='TOP-DOWN'`). `bottom-up` reverses
-them and writes `ROWORDER='BOTTOM-UP'`. Row reversal is rejected when WCS or
+them in every extension and writes `ROWORDER='BOTTOM-UP'`. Row reversal is rejected when WCS or
 distortion keywords are present. Ordinary NINA pointing hints such as RA, DEC,
 and EQUINOX are retained. Supported Bayer patterns are normalized to the first
 output pixel, with zero `XBAYROFF`/`YBAYROFF`; reversal accounts for image-height
@@ -147,7 +166,9 @@ offsets, or unsupported patterns fail.
   preserve their FITS real type. Full timestamp precision is retained. Existing
   capture keywords are not overwritten by properties. Conflicts are reported
   and both values remain available; a property may be stale even when its FITS
-  keyword is correct. A TimePoint matches `DATE-OBS` regardless of its trailing
+  keyword is correct. Numeric values within 1 ppm match: PixInsight widens
+  Float32 values into Float64 properties (`0.07000000029802322` for an
+  `APTDIA` of 70). A TimePoint matches `DATE-OBS` regardless of its trailing
   `Z` and insignificant fractional zeros. N.I.N.A. 3.x always writes
   `Instrument:Focuser:Position` as 0, so when `SWCREATE` names N.I.N.A. a zero
   value is retained without a conflict warning; `FOCUSPOS` holds the real
@@ -175,8 +196,10 @@ elements are omitted and reported. The default 72 pixels-per-inch display
 `Resolution` written by N.I.N.A. 3.0 carries no optical information and is
 omitted without a warning. Complex FITS keyword values are supported.
 XISF image/container layout and compression attributes are not reproduced as
-FITS metadata. Native PixInsight astrometric solutions are rejected because
-copying their properties would not make a usable FITS WCS solution.
+FITS metadata. Native PixInsight astrometric solutions (`PCL:AstrometricSolution:*`
+properties) are omitted as a whole, with one warning, because copying them
+would not make a usable FITS WCS solution; plate-solve the FITS image again if
+WCS is needed.
 
 This is a conversion with explicit limitations, **not an exact XISF metadata
 archive**. No original-XML extension or sidecar is created. Conventional readers
@@ -218,8 +241,8 @@ ctest --test-dir build --output-on-failure
 
 Fixtures are generated directly from XML and explicit pixel arrays, independent
 of the converter. Astropy strictly validates headers and compares all pixels,
-metadata types/values, and both HDU checksums. Tests cover codecs, subblocks,
-shuffle/storage variants, historical NINA metadata, corruption, CFA/WCS,
+metadata types/values, and every HDU checksum. Tests cover codecs, subblocks,
+shuffle/storage variants, Float32 masters, historical NINA metadata, corruption, CFA/WCS,
 filename syntax, reruns, collisions, and cancellation/publication failures.
 Linux fault tests use a test-only preloaded library; it is never installed with
 the converter. Permission tests require an unprivileged user.
@@ -232,8 +255,9 @@ ctest --test-dir build-sanitize --output-on-failure
 ```
 
 Optional real-archive validation scans headers and chooses representatives of
-each NINA version, plus a frame with PixInsight commentary. It independently
-checks source hashes/decompression, every pixel, and capture/property metadata.
+each NINA version, plus a frame with PixInsight commentary and one master per
+layout of image ids. It independently checks source hashes/decompression,
+every pixel of every image, and capture/property metadata.
 It writes only temporary outputs and does not modify the archive:
 
 ```sh
