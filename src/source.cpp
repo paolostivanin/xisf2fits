@@ -38,6 +38,13 @@ bool named(xmlNode* node, const char* name) {
     return node->type == XML_ELEMENT_NODE && xmlStrEqual(node->name, BAD_CAST name) &&
            node->ns && xmlStrEqual(node->ns->href, BAD_CAST "http://www.pixinsight.com/xisf");
 }
+// N.I.N.A. 3.0 writes the XISF default display resolution, 72 pixels per inch;
+// it says nothing about the optics, so only other values are reported.
+bool defaultResolution(xmlNode* node) {
+    const auto unit = attr(node, "unit");
+    return named(node, "Resolution") && attr(node, "horizontal") == "72" &&
+           attr(node, "vertical") == "72" && (unit.empty() || unit == "inch");
+}
 std::vector<xmlNode*> children(xmlNode* node, const char* name) {
     std::vector<xmlNode*> result;
     for (auto* child = node->children; child; child = child->next)
@@ -182,16 +189,17 @@ Block inspectBlock(xmlNode* node, uint64_t fileSize, uint64_t headerEnd) {
     return b;
 }
 
+// XISF 1.0 algorithm names, mapped to OpenSSL digest names.
+const std::map<std::string, std::string> checksumNames = {
+    {"SHA1", "SHA1"}, {"SHA-1", "SHA1"}, {"SHA256", "SHA256"}, {"SHA-256", "SHA256"},
+    {"SHA512", "SHA512"}, {"SHA-512", "SHA512"}, {"SHA3-256", "SHA3-256"}, {"SHA3-512", "SHA3-512"}
+};
+
 const EVP_MD* checksumAlgorithm(const Block& b, std::string& expected) {
     auto fields = split(b.checksum, ':');
     if (fields.size() != 2) fail("invalid source checksum: " + b.label);
-    // XISF 1.0 algorithm names, mapped to OpenSSL digest names.
-    static const std::map<std::string, std::string> names = {
-        {"SHA1", "SHA1"}, {"SHA-1", "SHA1"}, {"SHA256", "SHA256"}, {"SHA-256", "SHA256"},
-        {"SHA512", "SHA512"}, {"SHA-512", "SHA512"}, {"SHA3-256", "SHA3-256"}, {"SHA3-512", "SHA3-512"}
-    };
-    const auto name = names.find(upper(fields[0]));
-    if (name == names.end()) fail("unsupported source checksum algorithm: " + fields[0]);
+    const auto name = checksumNames.find(upper(fields[0]));
+    if (name == checksumNames.end()) fail("unsupported source checksum algorithm: " + fields[0]);
     auto* md = EVP_get_digestbyname(name->second.c_str());
     if (!md) fail("unavailable source checksum algorithm: " + name->second);
     expected = upper(fields[1]);
@@ -269,6 +277,18 @@ Bytes readBlock(const Block& b, std::ifstream& stream) {
 }
 }
 
+void initializeLibraries() {
+    xmlInitParser();
+    if (fits_init_cfitsio()) fail("cannot initialize CFITSIO");
+    // Digest nothing with each algorithm, so that OpenSSL loads its providers
+    // and method caches now rather than on concurrent first use.
+    for (const auto& entry : checksumNames) {
+        unsigned char digest[EVP_MAX_MD_SIZE]; unsigned int n = 0;
+        auto* md = EVP_get_digestbyname(entry.second.c_str());
+        if (md && EVP_Digest("", 0, digest, &n, md, nullptr) != 1) fail("cannot initialize digest " + entry.second);
+    }
+}
+
 Source readSource(const fs::path& path, bool dryRun) {
     Source source;
     std::ifstream stream(path, std::ios::binary | std::ios::ate);
@@ -299,7 +319,18 @@ Source readSource(const fs::path& path, bool dryRun) {
     if (!root || !named(root, "xisf") || attr(root, "version") != "1.0") fail("unsupported XISF root or version");
     auto images = children(root, "Image");
     if (images.empty()) fail("XISF contains no image");
-    if (images.size() != 1) throw Unsupported("expected one camera image; multi-image XISF unsupported");
+    if (images.size() != 1) {
+        // Masters carry rejection, weight, crop or slope maps beside the result.
+        std::string list;
+        bool master = false;
+        for (auto* node : images) {
+            const auto id = attr(node, "id");
+            master |= id.rfind("integration", 0) == 0;
+            list += (list.empty() ? "" : ", ") + (id.empty() ? "unnamed" : id) + " " + attr(node, "sampleFormat");
+        }
+        throw Unsupported((master ? "PixInsight integration master (" : "multi-image XISF (") + list +
+                          "); only single-image UInt16 camera frames are converted");
+    }
     auto* image = images.front();
     auto geometry = split(attr(image, "geometry"), ':');
     if (geometry.size() != 3) fail("invalid image geometry");
@@ -389,7 +420,7 @@ Source readSource(const fs::path& path, bool dryRun) {
     }
     for (auto* node = image->children; node; node = node->next)
         if (node->type == XML_ELEMENT_NODE && !named(node, "Property") && !named(node, "FITSKeyword") &&
-            !named(node, "ColorFilterArray") && !named(node, "Data"))
+            !named(node, "ColorFilterArray") && !named(node, "Data") && !defaultResolution(node))
             source.warnings.push_back("omitted XISF image element: " + std::string(reinterpret_cast<const char*>(node->name)));
     for (auto* node = root->children; node; node = node->next)
         if (node->type == XML_ELEMENT_NODE && !named(node, "Image") && !named(node, "Metadata"))

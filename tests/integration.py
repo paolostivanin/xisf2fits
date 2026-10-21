@@ -27,7 +27,7 @@ PIXELS = np.array([[0, 1, 255, 256], [32767, 32768, 65534, 65535], [17, 312, 100
 
 def fixture(path, pixels=PIXELS, keywords=(), properties=(), codec=None, shuffle=False,
             subblocks=False, checksum="sha-256", bad_checksum=False, location="attachment",
-            image_attrs=None, extra=(), raw_override=None, payload_override=None):
+            image_attrs=None, extra=(), raw_override=None, payload_override=None, siblings=()):
     """Write an XISF envelope directly, independently of converter/libXISF code."""
     pixels = np.asarray(pixels, dtype=np.uint16)
     raw = pixels.astype("<u2").tobytes() if raw_override is None else raw_override
@@ -59,6 +59,8 @@ def fixture(path, pixels=PIXELS, keywords=(), properties=(), codec=None, shuffle
     attrs.update(image_attrs or {})
     root = ET.Element("xisf", version="1.0", xmlns=NS)
     image = ET.SubElement(root, "Image", attrs)
+    for attributes in siblings:
+        ET.SubElement(root, "Image", attributes)
     if location == "inline:base64":
         image.text = base64.b64encode(stored).decode()
     elif location == "inline:base16":
@@ -239,7 +241,7 @@ class ConversionTests(unittest.TestCase):
                  ("IMAGE", "Enabled", "Boolean", "true", ""),
                  ("IMAGE", "SomeVector", "F64Vector", "1,2", "")]
         fixture(self.src, keywords=[("FOCUSPOS", "2946", ""), ("SITELAT", "45.6088888888889", "")], properties=props,
-                extra=[("Resolution", {"horizontal": "72", "vertical": "72", "unit": "inch"})])
+                extra=[("Resolution", {"horizontal": "300", "vertical": "300", "unit": "inch"})])
         r = self.convert("--verify")
         h = self.check_fits()
         self.assertEqual(h["XISF.IMAGE.INSTRUMENT.TELESCOPE.APERTURE"], .07)
@@ -255,14 +257,17 @@ class ConversionTests(unittest.TestCase):
 
     def test_known_benign_property_differences(self):
         # N.I.N.A. writes Instrument:Focuser:Position as 0; a TimePoint's Z and
-        # trailing fractional zeros do not change DATE-OBS.
+        # trailing fractional zeros do not change DATE-OBS. The default 72 dpi
+        # display Resolution is omitted without a warning.
         keywords = [("SWCREATE", "'N.I.N.A. 3.1.2.9001 (x64)'", ""), ("FOCUSPOS", "3200", ""),
                     ("DATE-OBS", "'2023-11-17T18:15:09.635'", "")]
         props = [("IMAGE", "Instrument:Focuser:Position", "Float32", "0", ""),
                  ("IMAGE", "Observation:Time:Start", "TimePoint", "2023-11-17T18:15:09.6350Z", "")]
-        fixture(self.src, keywords=keywords, properties=props)
+        fixture(self.src, keywords=keywords, properties=props,
+                extra=[("Resolution", {"horizontal": "72", "vertical": "72", "unit": "inch"})])
         r = self.convert("--verify")
         self.assertNotIn("conflicts", r.stderr)
+        self.assertNotIn("Resolution", r.stderr)
         h = self.check_fits()
         self.assertEqual((h["FOCUSPOS"], h["XISF.IMAGE.INSTRUMENT.FOCUSER.POSITION"]), (3200, 0.0))
         self.assertEqual(h["XISF.IMAGE.OBSERVATION.TIME.START"], "2023-11-17T18:15:09.6350Z")
@@ -528,6 +533,16 @@ class ConversionTests(unittest.TestCase):
         self.check_fits(path=self.root / "-output.fits.fz")
         self.assertRegex(self.run_converter("--version").stdout, r"^xisf2fits \d+\.\d+\.\d+\n$")
 
+    def test_jobs_option(self):
+        fixture(self.src)
+        for value in ("x", "-1", ""):
+            r = self.run_converter("--jobs", value, self.src, self.out, expected=1)
+            self.assertIn("invalid job count", r.stderr)
+        self.assertIn("--jobs requires a number", self.run_converter(self.src, self.out, "-j", expected=1).stderr)
+        # A single file is one job; 0 selects every hardware thread.
+        self.run_converter("-j", "0", "--verify", self.src, self.out)
+        self.check_fits()
+
     def test_failed_overwrite_preserves_output(self):
         fixture(self.src)
         self.convert("--verify")
@@ -571,9 +586,15 @@ class ConversionTests(unittest.TestCase):
         fixture(srcdir / "a.XISF")
         fixture(srcdir / "rgb.xisf", image_attrs={"colorSpace": "RGB"})
         fixture(srcdir / "good.xisf")
+        sibling = {"geometry": "4:3:1", "colorSpace": "Gray", "location": "attachment:16384:24"}
+        fixture(srcdir / "master.xisf", image_attrs={"id": "integration", "sampleFormat": "Float32"},
+                siblings=[{**sibling, "id": "rejection_low", "sampleFormat": "Float32"}])
+        fixture(srcdir / "pair.xisf", image_attrs={"id": "a"}, siblings=[{**sibling, "id": "b", "sampleFormat": "UInt16"}])
         r = self.run_converter("--verify", srcdir, outdir, expected=1)
         self.assertIn("destination collision", r.stderr)
-        self.assertIn("1 skipped, 2 failed", r.stdout)
+        self.assertIn("PixInsight integration master (integration Float32, rejection_low Float32)", r.stdout)
+        self.assertIn("multi-image XISF (a UInt16, b UInt16)", r.stdout)
+        self.assertIn("3 skipped, 2 failed", r.stdout)
         self.assertFalse((outdir / "a.fits.fz").exists())
         self.check_fits(path=outdir / "good.fits.fz")
 
@@ -591,6 +612,27 @@ class ConversionTests(unittest.TestCase):
         self.assertFalse((outdir / "x" / "a.fits.fz").exists())
         self.assertFalse((outdir / "X" / "a.fits.fz").exists())
         self.check_fits(path=outdir / "good.fits.fz")
+
+    def test_batch_jobs(self):
+        srcdir, outdir = self.root / "sources", self.root / "outputs"
+        # Concurrent workers create the same new output directories.
+        names = [Path(f"t{t}", f"s{s}", f"f{n}.xisf") for t in range(3) for s in range(2) for n in range(3)]
+        for name in names:
+            fixture(srcdir / name, keywords=[("OBJECT", f"'{name.stem}'", "")])
+        fixture(srcdir / "t0" / "corrupt.xisf", bad_checksum=True)
+        fixture(srcdir / "t1" / "rgb.xisf", image_attrs={"colorSpace": "RGB"})
+        r = self.run_converter("--jobs", "4", "--verify", srcdir, outdir, expected=1)
+        self.assertIn("18 converted, 1 skipped, 1 failed", r.stdout)
+        # Each file's result is printed whole, on its own line.
+        results = r.stdout.splitlines()[:-1]
+        self.assertEqual(len(results), 19)
+        self.assertTrue(all(line.startswith(("CONVERTED \"", "SKIPPED \"")) for line in results), results)
+        self.assertEqual(r.stderr.count("FAILED "), 1)
+        for name in names:
+            self.assertEqual(self.check_fits(path=outdir / name.with_suffix(".fits.fz"))["OBJECT"], name.stem)
+        self.assertFalse(list(outdir.rglob(".xisf2fits-*")))
+        r = self.run_converter("-j", "0", "--verify", srcdir, outdir, expected=1)
+        self.assertIn("0 converted, 19 skipped, 1 failed", r.stdout)
 
     def test_batch_unreadable_directory(self):
         if os.geteuid() == 0:
@@ -663,6 +705,18 @@ class ConversionTests(unittest.TestCase):
         self.assertIn("interrupted", r.stderr)
         self.assertEqual(self.out.read_text(), "previous output")
         self.assertFalse(list(self.root.glob(".xisf2fits-*")))
+
+    def test_signal_stops_all_jobs_and_cleans_up(self):
+        srcdir, outdir = self.root / "sources", self.root / "outputs"
+        for n in range(8):
+            fixture(srcdir / f"d{n}" / "frame.xisf")
+        # Every worker raises SIGTERM when syncing its temporary file.
+        r = self.run_converter("--jobs", "4", srcdir, outdir, expected=128+signal.SIGTERM, env=self.fault_environment("interrupt"))
+        self.assertIn("interrupted", r.stderr)
+        self.assertNotIn("Summary", r.stdout)
+        # Temporary and newly created directories are removed; outdir itself may
+        # remain if another worker still used it when its creator cleaned up.
+        self.assertEqual(list(outdir.rglob("*")) if outdir.exists() else [], [])
 
     def test_invalid_header_rejected_even_with_valid_checksums(self):
         srcdir, outdir = self.root / "sources", self.root / "outputs"

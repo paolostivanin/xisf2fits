@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <mutex>
 #include <set>
 #include <system_error>
 #include <unistd.h>
@@ -27,6 +28,13 @@ public:
         checkFits(status, "close FITS file");
     }
 };
+// Concurrent conversions share output directories. Without this lock, one
+// could remove an empty directory it created just before another creates its
+// temporary directory there.
+std::mutex directoryLock;
+// CFITSIO timestamps checksum comments using gmtime(), whose result buffer is
+// shared by every thread.
+std::mutex clockLock;
 [[noreturn]] void ioError(const std::string& operation, const fs::path& path) {
     throw std::system_error(errno, std::generic_category(), operation + ": " + path.string());
 }
@@ -120,10 +128,13 @@ void writeFits(const fs::path& path, const Source& source, bool bottomUp, const 
                        const_cast<uint16_t*>(source.pixels.data() + sourceY * width), &status);
         checkFits(status, "write compressed image row");
     }
-    fits_write_chksum(file.ptr, &status);
-    int type = 0;
-    fits_movabs_hdu(file.ptr, 1, &type, &status);
-    fits_write_chksum(file.ptr, &status);
+    {
+        std::lock_guard<std::mutex> lock(clockLock);
+        fits_write_chksum(file.ptr, &status);
+        int type = 0;
+        fits_movabs_hdu(file.ptr, 1, &type, &status);
+        fits_write_chksum(file.ptr, &status);
+    }
     checkFits(status, "write FITS checksums");
     file.close();
 }
@@ -251,6 +262,7 @@ void publish(const fs::path& temporary, const fs::path& destination, bool overwr
 
 TemporaryOutput::TemporaryOutput(const fs::path& output) {
     const auto parent = fs::absolute(output).parent_path();
+    std::lock_guard<std::mutex> lock(directoryLock);
     try {
         std::vector<fs::path> missing;
         for (auto p = parent; !fs::exists(p); p = p.parent_path()) missing.push_back(p);
@@ -272,6 +284,7 @@ TemporaryOutput::~TemporaryOutput() {
     std::error_code ignored;
     fs::remove(file, ignored);
     fs::remove(directory, ignored);
+    std::lock_guard<std::mutex> lock(directoryLock);
     for (auto it = createdDirectories.rbegin(); it != createdDirectories.rend(); ++it) fs::remove(*it, ignored);
 }
 }

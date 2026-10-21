@@ -3,6 +3,31 @@
 The conversion contract is in README.md. This file records what changed in
 each release and the design decisions for issues that remain open.
 
+## Unreleased
+
+- **`-j`/`--jobs N` converts files in parallel in directory mode.** The default
+  stays at 1; `0` uses every hardware thread. On the reference archive's
+  single hard disk, 8 jobs converted cold NINA frames with `--verify` 4.4
+  times faster than one (5.1 instead of 1.15 frames per second), and more jobs
+  added only seeking. Each file's diagnostics are printed together. Libraries
+  that initialize lazily (libxml2, CFITSIO, OpenSSL digests) are initialized
+  before workers start. CFITSIO's checksum timestamps, which use the
+  non-reentrant `gmtime()`, are written one file at a time. New output
+  directories are created and removed under a lock, so one worker cannot
+  remove a directory just before another uses it. ThreadSanitizer reports no
+  races in conversion, verification, overwrite, or dry-run batches of real
+  frames.
+- **Multi-image skips say what the file is.** The 141 PixInsight masters in
+  the reference archive were skipped as "multi-image XISF unsupported", which
+  hid that their images are Float32. The reason now lists each image's id and
+  sample format and names integration masters, for example
+  `PixInsight integration master (integration Float32, rejection_low Float32,
+  rejection_high Float32)`. Masters are still skipped.
+- **The default `Resolution` is omitted silently.** N.I.N.A. 3.0.0.1075 writes
+  `<Resolution horizontal="72" vertical="72" unit="inch"/>`, the XISF default
+  display resolution, which says nothing about the optics. It accounted for 42
+  of the 43 diagnostic lines in a 0.4 dry run. Other values are still reported.
+
 ## 0.4.0
 
 Checked against a 12,843-frame N.I.N.A. 3.0–3.2 archive: a dry run went from

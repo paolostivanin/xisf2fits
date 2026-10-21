@@ -5,7 +5,7 @@
 #include <string_view>
 
 namespace x2f {
-volatile std::sig_atomic_t interrupted = 0;
+std::atomic<int> interrupted{0};
 void checkpoint() { if (interrupted) throw Cancelled(); }
 [[noreturn]] void fail(const std::string& message) { throw std::runtime_error(message); }
 

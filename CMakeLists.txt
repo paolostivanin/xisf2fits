@@ -16,11 +16,12 @@ pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4)
 pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(ZLIB 1.2.9 REQUIRED)
+find_package(Threads REQUIRED)
 
 add_library(converter STATIC src/common.cpp src/source.cpp src/metadata.cpp src/fits.cpp)
 target_include_directories(converter PUBLIC src)
 target_link_libraries(converter PUBLIC PkgConfig::CFITSIO PkgConfig::XML PkgConfig::LZ4
-    PkgConfig::ZSTD OpenSSL::Crypto ZLIB::ZLIB)
+    PkgConfig::ZSTD OpenSSL::Crypto ZLIB::ZLIB Threads::Threads)
 add_executable(xisf2fits src/main.cpp)
 target_link_libraries(xisf2fits PRIVATE converter)
 target_compile_definitions(xisf2fits PRIVATE XISF2FITS_VERSION="${PROJECT_VERSION}")

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fitsio.h>
+#include <atomic>
 #include <csignal>
 #include <cstdint>
 #include <filesystem>
@@ -13,7 +14,9 @@ namespace fs = std::filesystem;
 
 struct Unsupported : std::runtime_error { using std::runtime_error::runtime_error; };
 struct Cancelled : std::runtime_error { Cancelled() : std::runtime_error("interrupted") {} };
-extern volatile std::sig_atomic_t interrupted;
+// Set by signal handlers and read by every worker thread.
+extern std::atomic<int> interrupted;
+static_assert(std::atomic<int>::is_always_lock_free, "signal handlers need a lock-free flag");
 void checkpoint();
 [[noreturn]] void fail(const std::string& message);
 void checkFits(int status, const std::string& operation);
@@ -35,6 +38,9 @@ struct Source {
     std::vector<std::string> warnings;
     bool imageChecksumVerified = false;
 };
+// libxml2, CFITSIO and OpenSSL initialize lazily, which is not thread-safe:
+// call this once before starting worker threads.
+void initializeLibraries();
 Source readSource(const fs::path& path, bool dryRun);
 
 enum class ValueType { Undefined, String, Logical, Integer, Real, Complex, Commentary };

@@ -46,6 +46,7 @@ path; directory symlinks are not followed.
 ./build/xisf2fits --verify input.xisf out.fits.fz
 ./build/xisf2fits --dry-run ~/astro/raw ./fits-output
 ./build/xisf2fits --verify ~/astro/raw ./fits-output
+./build/xisf2fits --verify --jobs 8 ~/astro/raw ./fits-output
 ```
 
 | Option | Behavior |
@@ -54,10 +55,18 @@ path; directory symlinks are not followed.
 | `--dry-run` | Validate source headers, block bounds, metadata representability, and planned destinations without writing files or decoding pixels. Source block hashes are **not** checked. Attached string properties are deferred until conversion. |
 | `--overwrite` | Replace an existing output after successful conversion and optional output verification. |
 | `--row-order ORDER` | `top-down` (default) or `bottom-up`. Repeated options use the last value. |
+| `-j`, `--jobs N` | Convert up to N files at once in directory mode (default 1); `0` uses every hardware thread. |
 | `--verbose` | For each file, list the keywords whose header comments were shortened. |
 | `--version` | Print the program version. |
 | `-h`, `--help` | Print help. |
 | `--` | End option parsing; subsequent arguments are filenames. |
+
+Conversion is CPU-bound, about 0.7 s per 6252×4176 frame with `--verify` on
+one core. Each job needs about 150 MB of memory for such a frame. With more
+than one job, files finish out of order, but each file's warnings and result
+are printed together. On a single hard disk, reads limit the gain: reading
+NINA frames from one 7200 rpm disk, 8 jobs were 4.4 times faster than one, and
+16 or more were no faster.
 
 Without `--overwrite`, an existing single-file output is an error. In directory
 mode, existing regular outputs are skipped without inspection unless `--verify`
@@ -67,7 +76,9 @@ compares the converter's canonical metadata records, so an externally edited
 header with different formatting can require regeneration even if values match.
 
 Unsupported sample formats, RGB images, and multi-image containers are skipped
-in batches. Malformed data is a failure. Directory-access failures are reported
+in batches. A multi-image skip lists each image's id and sample format, and
+names PixInsight integration masters, which carry rejection, weight, or crop
+maps beside the Float32 result. Malformed data is a failure. Directory-access failures are reported
 while other directories continue. Inputs mapping to the same destination are
 reported as collisions before either is converted. Destinations differing only
 in ASCII letter case (`M31/a.xisf` and `m31/a.xisf`) also collide, even on
@@ -160,7 +171,9 @@ spaces.
 
 Vectors, matrices, complex **properties**, properties that cannot fit even using
 HIERARCH, thumbnails, ICC profiles, display settings, and other unsupported XML
-elements are omitted and reported. Complex FITS keyword values are supported.
+elements are omitted and reported. The default 72 pixels-per-inch display
+`Resolution` written by N.I.N.A. 3.0 carries no optical information and is
+omitted without a warning. Complex FITS keyword values are supported.
 XISF image/container layout and compression attributes are not reproduced as
 FITS metadata. Native PixInsight astrometric solutions are rejected because
 copying their properties would not make a usable FITS WCS solution.
@@ -241,6 +254,9 @@ Windows is not supported.
   was already published; `--verify` on a rerun confirms it.
 - A single unrepresentable value fails the whole file rather than omitting that
   value: for example a NaN numeric property.
+- CFITSIO keeps one error-message stack for the whole process. With more than
+  one job, the detail lines under a FITS error can include messages from
+  another file being converted at the same time, or miss some of their own.
 - The decoded image size is bounded only by its declared geometry and the
   exact-size checks, not by an application memory budget. A small compressed
   block declaring a very large image can allocate accordingly before its
